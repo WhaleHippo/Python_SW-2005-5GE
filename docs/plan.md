@@ -17,6 +17,7 @@
 1. **간단한 time-based capture**
    - `camera.capture(duration_s=5)`처럼 일정 시간 촬상하고 이미지 목록/iterator/result를 얻는다.
    - trigger off 내부 라인레이트 모드와 trigger on 외부/소프트웨어 트리거 모드를 모두 지원한다.
+   - `copy_frames=True`를 기본값으로 하여 buffer release 이후에도 안전하게 이미지 데이터를 사용할 수 있게 한다.
 2. **안전한 제한적 설정 노출**
    - 임의 GenICam parameter 이름을 받아서 `set_param("AnyDangerousFeature", value)`처럼 쓰는 공개 API는 만들지 않는다.
    - 필요한 설정만 property 또는 명시적 getter/setter로 제공한다.
@@ -83,7 +84,8 @@
 
 이번 1차 범위:
 
-- 기본 연결은 `DEVICE_IP_ADDR`를 우선 사용한다.
+- 기본 연결/강제 IP 할당은 `DEVICE_IP_ADDR`를 우선 사용한다.
+- 이 라이브러리는 기본적으로 1대의 라인스캔 카메라만 대상으로 한다.
 - 복잡한 device selection UI/API는 만들지 않는다.
 
 ### 2.5 `eBUS_examples/ImageProcessing.py`
@@ -149,6 +151,9 @@ with LineScanCamera() as cam:
     cam.width = 4096
     cam.height = 256
     cam.trigger_mode = True
+    cam.trigger_selector = "LineStart"
+    cam.trigger_source = "Line4"
+    cam.trigger_activation = "RisingEdge"
     cam.exposure_time = 5.0
     cam.gain = 1.0
 
@@ -178,6 +183,9 @@ with LineScanCamera() as cam:
 | Python property | GenICam feature | 용도 |
 |---|---|---|
 | `trigger_mode: bool` | `TriggerMode` | trigger on/off |
+| `trigger_selector: str` | `TriggerSelector` | trigger 대상 선택. trigger on에서 주로 `LineStart` |
+| `trigger_source: str` | `TriggerSource` | 외부 입력/encoder/software 등 trigger source |
+| `trigger_activation: str` | `TriggerActivation` | RisingEdge/FallingEdge/LevelHigh/LevelLow |
 | `gain: float` | `Gain` with `GainSelector=DigitalAll` | 밝기 조절 |
 | `exposure_time: float` | `ExposureTime` | 노출 시간 |
 | `acquisition_line_rate: float` | `AcquisitionLineRate` | trigger off 내부 라인레이트 |
@@ -194,11 +202,16 @@ with LineScanCamera() as cam:
 - getter는 내부에서 `_read_feature()`를 호출한다.
 - 실패 시 어떤 feature가 실패했는지 포함한 `LineScanError`를 던진다.
 - 필요 기능이 추가되면 새 property를 명시적으로 추가한다.
+- 각 public property에는 docstring 또는 getter/setter 주석을 달아 어떤 GenICam feature에 연결되는지, 단위가 무엇인지, trigger on/off 중 언제 의미가 있는지 설명한다.
+- 각 public 함수에는 목적, 주요 인자, 반환값, cleanup/side effect를 설명하는 docstring을 작성한다.
 
 예시:
 
 ```python
 cam.trigger_mode = False
+cam.trigger_selector = "LineStart"
+cam.trigger_source = "Line4"
+cam.trigger_activation = "RisingEdge"
 cam.width = 4096
 cam.height = 256
 cam.gain = 1.0
@@ -215,19 +228,19 @@ print(cam.device_link_speed)
 
 | Python property / init arg | 기본값 | 용도 |
 |---|---:|---|
-| `device_ip_addr` / `DEVICE_IP_ADDR` | `"192.168.1.200"` | 라인스캔 카메라에 강제 할당/연결할 IP 주소 |
+| `device_ip_addr` / `DEVICE_IP_ADDR` | `"192.168.1.200"` | 1대의 라인스캔 카메라에 강제 할당하고 연결할 IP 주소 |
 | `pipeline_buffer_count` / `PIPELINE_BUFFER_COUNT` | `64` | `PvPipeline`에 사용할 buffer count |
 | `timeout_ms` | `1000` | buffer retrieve timeout |
-| `copy_frames` | `True` 후보 | capture 결과 frame을 안전하게 copy할지 여부 |
+| `copy_frames` | `True` | capture 결과 frame을 안전하게 copy할지 여부 |
 | `debug` | `False` | capture 중 interval debug 출력 여부 |
 | `debug_interval_s` | `1.0` | bandwidth/FPS/error 출력 주기 |
 
 IP 관련 구현 방향:
 
-- 기본 connection ID는 `DEVICE_IP_ADDR = "192.168.1.200"`로 둔다.
-- 실제 eBUS `CreateAndConnect()`에 이 IP string을 넘기는 방식부터 구현한다.
-- “강제 할당”이 Pleora SDK의 force IP command를 의미하는 경우, 1차 구현에서는 명시적으로 `force_ip()` helper 후보로 분리하고 자동 실행하지 않는다.
-  - 이유: force IP는 네트워크 장치 설정에 영향을 주는 side effect가 커서 안전하게 검증해야 한다.
+- `DEVICE_IP_ADDR = "192.168.1.200"`는 단순 연결 IP가 아니라 카메라에 강제 할당할 IP까지 의미한다.
+- 이 라이브러리는 기본적으로 1대의 카메라만 대상으로 하므로, 초기화 시 해당 카메라를 `DEVICE_IP_ADDR`로 맞춘 뒤 그 IP로 연결하는 흐름을 기본으로 설계한다.
+- 구현 시 eBUS/Pleora SDK에서 제공하는 force-IP API를 확인해 `force_device_ip()` 내부 helper 또는 명시적 method로 구현한다.
+- force IP는 네트워크 장치 설정에 영향을 주므로 실패 시 즉시 명확한 예외를 던지고, debug summary에 force-IP 시도/성공 여부를 남긴다.
 
 ---
 
@@ -310,6 +323,9 @@ class CaptureResult:
 
 ### 6.1 생성자
 
+모든 public class/function/property에는 한국어 주석 또는 docstring을 작성한다. 특히 단위(`ExposureTime` µs, `AcquisitionLineRate` Hz 등), 안전한 기본값, 하드웨어 side effect를 명시한다.
+
+
 ```python
 class LineScanCamera:
     def __init__(
@@ -318,6 +334,7 @@ class LineScanCamera:
         pipeline_buffer_count: int = PIPELINE_BUFFER_COUNT,
         timeout_ms: int = 1000,
         copy_frames: bool = True,
+        force_ip: bool = True,
         debug: bool = False,
         debug_interval_s: float = 1.0,
     ):
@@ -327,6 +344,7 @@ class LineScanCamera:
 책임:
 
 - eBUS lazy import
+- `force_ip=True`이면 대상 카메라를 `device_ip_addr`로 강제 할당
 - device 연결
 - stream open
 - GigE stream destination 설정
@@ -362,7 +380,7 @@ def capture(
     *,
     trigger_mode: bool | None = None,
     store_frames: bool = True,
-    copy_frames: bool | None = None,
+    copy_frames: bool | None = None,  # None이면 self.copy_frames(True 기본값)를 사용
     on_frame: Callable[[LineScanFrame], None] | None = None,
     debug: bool | None = None,
 ) -> CaptureResult:
@@ -479,10 +497,12 @@ retrieve_errors: 0
 1. module constants 추가
    - `DEVICE_IP_ADDR = "192.168.1.200"`
    - `PIPELINE_BUFFER_COUNT = 64`
-2. 생성자 인자로 `device_ip_addr`, `pipeline_buffer_count`, `timeout_ms`, `copy_frames`, `debug`, `debug_interval_s` 추가
-3. `open()`, `close()`, context manager 구현
-4. fake device/stream으로 close idempotency test 작성
-5. Commit: `feat: add simple line scan camera lifecycle`
+2. 생성자 인자로 `device_ip_addr`, `pipeline_buffer_count`, `timeout_ms`, `copy_frames=True`, `force_ip=True`, `debug`, `debug_interval_s` 추가
+3. eBUS/Pleora force-IP API를 확인해 `DEVICE_IP_ADDR` 강제 할당 흐름 구현
+4. `open()`, `close()`, context manager 구현
+5. fake device/stream으로 close idempotency test 작성
+6. force-IP 실패 시 명확한 예외가 나는지 test 작성
+7. Commit: `feat: add simple line scan camera lifecycle`
 
 ### Task 4: 제한된 property 구현
 
@@ -496,6 +516,9 @@ retrieve_errors: 0
 - `trigger_mode`
 - `gain`
 - `exposure_time`
+- `trigger_selector`
+- `trigger_source`
+- `trigger_activation`
 - `acquisition_line_rate`
 - `gev_scps_packet_size`
 - `network_throughput_safety_margin`
@@ -505,10 +528,12 @@ retrieve_errors: 0
 
 **Steps:**
 1. bool `trigger_mode`와 GenICam 문자열 `On`/`Off` mapping 구현
-2. `gain` setter에서 필요하면 `GainSelector=DigitalAll` 먼저 설정
-3. read-only `device_link_speed`에 setter가 없음을 test
-4. 각 property가 올바른 GenICam feature 이름을 쓰는지 fake parameter로 test
-5. Commit: `feat: expose safe camera properties`
+2. `trigger_selector`, `trigger_source`, `trigger_activation` 문자열 property 구현
+3. `gain` setter에서 필요하면 `GainSelector=DigitalAll` 먼저 설정
+4. read-only `device_link_speed`에 setter가 없음을 test
+5. 각 property가 올바른 GenICam feature 이름을 쓰는지 fake parameter로 test
+6. 각 property getter/setter에 주석/docstring 작성
+7. Commit: `feat: expose safe camera properties`
 
 ### Task 5: Pipeline 준비와 transport 설정 구현
 
@@ -560,7 +585,7 @@ retrieve_errors: 0
 3. pipeline start / stream enable / acquisition start 순서 구현
 4. duration 동안 retrieve loop 구현
 5. `LineScanFrame` 생성
-6. `store_frames`, `copy_frames`, `on_frame` 처리
+6. `store_frames`, `copy_frames`, `on_frame` 처리. 기본은 `copy_frames=True`로 안전성을 우선
 7. finally에서 release/stop/disable 보장
 8. fake pipeline으로 duration/stop_after 대체 가능한 test 작성
 9. Commit: `feat: implement timed image capture`
@@ -641,6 +666,7 @@ retrieve_errors: 0
    - `capture(duration_s=3, debug=True)` 실행
 4. TriggerMode On capture
    - `trigger_mode=True`
+   - `trigger_selector="LineStart"`, `trigger_source`, `trigger_activation` 설정
    - 외부 trigger 입력 중 `capture(duration_s=10, debug=True)` 실행
 5. Debug counter 확인
    - bandwidth/FPS 출력
@@ -650,16 +676,18 @@ retrieve_errors: 0
 
 ---
 
-## 11. 남은 확인 사항
+## 11. 확정된 설계 결정
 
-개발 전에 아래만 확인하면 된다.
+사용자 피드백으로 아래는 확정한다.
 
-1. `capture()`의 기본 동작을 `copy_frames=True`로 안전하게 둘지, 성능 우선으로 `False`로 둘지
-   - 추천: 초보 사용성과 안전성을 위해 기본 `True`, 고속 장시간 처리 시 `store_frames=False + on_frame` 권장
-2. `DEVICE_IP_ADDR`가 “연결할 IP”인지, Pleora force-IP 명령으로 “강제 할당할 IP”까지 의미하는지
-   - 추천: 1차는 연결 IP로만 사용. force-IP는 별도 explicit method로 나중에 추가
-3. trigger on일 때 추가로 `TriggerSelector=LineStart`, `TriggerSource`, `TriggerActivation` property도 바로 필요할지
-   - 현재 요청 필수 목록에는 없으므로 1차에서는 `trigger_mode`만 넣고, 필요 시 추가
+1. `capture()`의 기본 동작은 `copy_frames=True`이다.
+   - 안전성을 우선한다.
+   - 고속/장시간 취득에서 메모리 사용량을 줄이고 싶으면 `store_frames=False + on_frame` 또는 `copy_frames=False`를 명시적으로 사용한다.
+2. `DEVICE_IP_ADDR`는 연결할 IP일 뿐 아니라 카메라에 강제 할당할 IP까지 의미한다.
+   - 기본값은 `192.168.1.200`이다.
+   - 라이브러리는 기본적으로 1대의 라인스캔 카메라만 대상으로 한다.
+3. trigger on 설정을 위해 `TriggerSelector`, `TriggerSource`, `TriggerActivation`도 public property로 제공한다.
+4. 코드 작성 시 각 public property와 함수에 주석/docstring을 달아 사용 목적, 단위, side effect를 설명한다.
 
 ---
 
@@ -669,7 +697,9 @@ retrieve_errors: 0
 - `TriggerMode=On/Off` 모두 지원한다.
 - 필요한 설정은 property로만 노출한다.
 - 위험한 generic GenICam public setter는 없다.
-- `DEVICE_IP_ADDR`, `PIPELINE_BUFFER_COUNT`를 제어할 수 있다.
+- `DEVICE_IP_ADDR`로 1대 카메라에 force-IP 할당 후 연결할 수 있다.
+- `PIPELINE_BUFFER_COUNT`를 제어할 수 있다.
 - capture 결과로 image frames와 stats를 받을 수 있다.
 - debug mode에서 bandwidth, FPS, packet/error 정보를 확인할 수 있다.
 - buffer release와 acquisition stop/stream disable/pipeline stop cleanup이 항상 보장된다.
+- 각 public property와 함수에는 주석/docstring이 있다.
