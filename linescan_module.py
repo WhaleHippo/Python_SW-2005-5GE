@@ -933,3 +933,106 @@ __all__ = [
     "LineScanFrame",
     "LineScanStats",
 ]
+
+
+def main() -> None:
+    """이 파일을 직접 실행했을 때 라이브러리 사용 방법을 출력합니다.
+
+    실제 카메라 capture는 hardware/network 설정에 영향을 줄 수 있으므로, 예제는
+    자동 실행하지 않고 복사해서 쓰는 코드 형태로만 보여줍니다.
+    """
+    print(
+        """
+LineScanCamera 사용 방법
+========================
+
+1) 기본 TriggerMode=Off capture
+-------------------------------
+from linescan_module import LineScanCamera
+
+with LineScanCamera() as cam:
+    cam.width = 4096
+    cam.height = 256          # line-scan에서 한 frame/block으로 묶을 line 수
+    cam.trigger_mode = False  # 내부 line-rate 모드
+    cam.acquisition_line_rate = 84000.0  # Hz
+    cam.exposure_time = 5.0   # us
+    cam.gain = 1.0
+
+    result = cam.capture(duration_s=3.0, debug=True)
+
+print(len(result.frames))
+print(result.stats.avg_bandwidth_mbps)
+print(result.debug_summary())
+
+
+2) TriggerMode=On 외부 trigger capture
+--------------------------------------
+from linescan_module import LineScanCamera
+
+with LineScanCamera() as cam:
+    cam.width = 4096
+    cam.height = 256
+    cam.trigger_mode = True
+    cam.trigger_selector = "LineStart"
+    cam.trigger_source = "Line4"
+    cam.trigger_activation = "RisingEdge"
+    cam.exposure_time = 5.0   # us
+    cam.gain = 1.0
+
+    # 외부 trigger가 들어오는 동안 10초간 수신합니다.
+    result = cam.capture(duration_s=10.0, debug=True)
+
+print(result.debug_summary())
+
+
+3) IP / buffer count 변경
+-------------------------
+from linescan_module import LineScanCamera
+
+with LineScanCamera(
+    device_ip_addr="192.168.1.200",
+    pipeline_buffer_count=64,
+    timeout_ms=1000,
+    copy_frames=True,
+    force_ip=True,
+    debug=True,
+) as cam:
+    result = cam.capture(duration_s=5.0)
+
+
+4) 장시간/고속 취득: callback으로 처리하고 frame list 저장 안 함
+---------------------------------------------------------------
+from linescan_module import LineScanCamera
+
+with LineScanCamera(copy_frames=True) as cam:
+    def on_frame(frame):
+        # frame.image는 기본적으로 buffer release 후에도 안전하게 복사된 payload입니다.
+        # 여기서 파일 저장, queue 전달, 분석 등을 수행합니다.
+        pass
+
+    result = cam.capture(
+        duration_s=10.0,
+        store_frames=False,
+        on_frame=on_frame,
+        debug=True,
+    )
+
+print(result.stats.frames)
+print(result.debug_summary())
+
+
+주의 사항
+---------
+- 기본 DEVICE_IP_ADDR는 "192.168.1.200"입니다.
+- 기본 force_ip=True는 발견된 첫 GigE Vision 카메라에 해당 IP를 강제 할당하려고 합니다.
+  네트워크 설정에 영향을 주므로 원치 않으면 LineScanCamera(force_ip=False)를 사용하세요.
+- public generic set_param/get_param API는 없습니다. 필요한 설정은 명시된 property만 사용합니다.
+- copy_frames=True가 기본값이라 안전하지만, 고속/장시간 취득에서는 메모리 사용량이 커질 수 있습니다.
+  이 경우 store_frames=False + on_frame callback을 권장합니다.
+- 실제 hardware 검증 전에는 `python3 -m py_compile linescan_module.py`로 문법 확인이 가능합니다.
+""".strip()
+    )
+
+
+if __name__ == "__main__":
+    main()
