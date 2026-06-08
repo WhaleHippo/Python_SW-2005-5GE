@@ -8,10 +8,14 @@
 
 from __future__ import annotations
 
-import importlib
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from types import TracebackType
+from typing import Callable
+
+import eBUS as eb
+
+FeatureValue = str | int | float | bool
 
 DEVICE_IP_ADDR = "192.168.1.200"
 """기본 카메라 IP. `force_ip=True`일 때 카메라에 강제 할당할 목표 IP입니다."""
@@ -51,7 +55,7 @@ class LineScanFrame:
         operational_code: payload operational result code 문자열입니다.
     """
 
-    image: Any
+    image: object
     block_id: int | None
     width: int | None
     height: int | None
@@ -111,7 +115,7 @@ class LineScanStats:
             return 0.0
         return self.error_count / self.frames
 
-    def update_from_buffer(self, pvbuffer: Any) -> None:
+    def update_from_buffer(self, pvbuffer: eb.PvBuffer) -> None:
         """eBUS pvbuffer에서 frame/packet counter를 누적합니다."""
         self.frames += 1
         self.bytes_acquired += _safe_int_call(pvbuffer, "GetAcquiredSize")
@@ -141,7 +145,7 @@ class CaptureResult:
 
     frames: list[LineScanFrame]
     stats: LineScanStats
-    settings: dict[str, Any] = field(default_factory=dict)
+    settings: dict[str, object] = field(default_factory=dict)
 
     def debug_summary(self) -> str:
         """사람이 읽기 쉬운 capture summary 문자열을 반환합니다."""
@@ -168,8 +172,8 @@ class CaptureResult:
 class LineScanCamera:
     """SW-2005/4005 5GigE 라인스캔 카메라의 단순 time-based capture wrapper.
 
-    생성자는 설정값만 보관하고, 실제 eBUS import/장치 연결은 `open()` 또는 context
-    manager 진입 시 수행합니다. `force_ip=True`이면 discovery로 찾은 첫 GEV 장치의
+    생성자는 설정값만 보관하고, 실제 장치 연결은 `open()` 또는 context manager 진입 시
+    수행합니다. `force_ip=True`이면 discovery로 찾은 첫 GEV 장치의
     MAC 주소에 `device_ip_addr`를 강제 할당한 뒤 해당 IP로 연결을 시도합니다. 이 작업은
     장치 네트워크 설정에 영향을 주는 hardware side effect입니다.
     """
@@ -183,8 +187,6 @@ class LineScanCamera:
         force_ip: bool = True,
         debug: bool = False,
         debug_interval_s: float = 1.0,
-        *,
-        eb_module: Any | None = None,
     ):
         if pipeline_buffer_count <= 0:
             raise ValueError("pipeline_buffer_count must be positive")
@@ -201,13 +203,12 @@ class LineScanCamera:
         self.debug = debug
         self.debug_interval_s = debug_interval_s
 
-        self._eb: Any = eb_module
-        self._device: Any = None
-        self._stream: Any = None
-        self._pipeline: Any = None
+        self._device: eb.PvDevice | None = None
+        self._stream: eb.PvStream | None = None
+        self._pipeline: eb.PvPipeline | None = None
         self._is_open = False
         self._is_acquiring = False
-        self._connection_id: Any | None = None
+        self._connection_id: str | None = None
         self._force_ip_attempted = False
         self._force_ip_succeeded = False
         self._force_ip_message: str | None = None
@@ -222,18 +223,17 @@ class LineScanCamera:
         if self._is_open:
             return self
 
-        self._eb = self._eb or importlib.import_module("eBUS")
         try:
             if self.force_ip:
                 self.force_device_ip(self.device_ip_addr)
 
             self._connection_id = self.device_ip_addr
-            result, device = self._eb.PvDevice.CreateAndConnect(self._connection_id)
+            result, device = eb.PvDevice.CreateAndConnect(self._connection_id)
             if device is None or not _result_ok(result):
                 raise EBusResultError(f"PvDevice.CreateAndConnect failed: {_describe_result(result)}")
             self._device = device
 
-            result, stream = self._eb.PvStream.CreateAndOpen(self._connection_id)
+            result, stream = eb.PvStream.CreateAndOpen(self._connection_id)
             if stream is None or not _result_ok(result):
                 raise EBusResultError(f"PvStream.CreateAndOpen failed: {_describe_result(result)}")
             self._stream = stream
@@ -279,7 +279,7 @@ class LineScanCamera:
             except Exception:
                 pass
             try:
-                self._eb.PvStream.Free(stream)
+                eb.PvStream.Free(stream)
             except Exception:
                 pass
             self._stream = None
@@ -290,7 +290,7 @@ class LineScanCamera:
             except Exception:
                 pass
             try:
-                self._eb.PvDevice.Free(device)
+                eb.PvDevice.Free(device)
             except Exception:
                 pass
             self._device = None
@@ -301,7 +301,12 @@ class LineScanCamera:
         """context manager 진입 시 자동으로 `open()`합니다."""
         return self.open()
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         """context manager 종료 시 예외 여부와 관계없이 `close()`합니다."""
         self.close()
 
@@ -373,18 +378,16 @@ class LineScanCamera:
                 result, pvbuffer, operational_result = pipeline.RetrieveNextBuffer(self.timeout_ms)
                 if not _result_ok(result):
                     stats.retrieve_errors += 1
-                    self._maybe_print_debug(
-                        effective_debug,
-                        stats,
-                        frame_rate_param,
-                        bandwidth_param,
-                        start_time,
-                        last_debug_time,
-                        last_debug_frames,
-                        last_debug_bytes,
-                    )
                     now = time.monotonic()
                     if effective_debug and now - last_debug_time >= self.debug_interval_s:
+                        self._print_debug_interval(
+                            stats,
+                            frame_rate_param,
+                            bandwidth_param,
+                            now - last_debug_time,
+                            stats.frames - last_debug_frames,
+                            stats.bytes_acquired - last_debug_bytes,
+                        )
                         last_debug_time = now
                         last_debug_frames = stats.frames
                         last_debug_bytes = stats.bytes_acquired
@@ -460,7 +463,6 @@ class LineScanCamera:
         장치 네트워크 설정을 바꾸는 side effect가 있으므로 실패하면 `LineScanError`를
         발생시킵니다. 이미 목표 IP인 경우에도 성공으로 기록합니다.
         """
-        self._eb = self._eb or importlib.import_module("eBUS")
         target_ip = ip_addr or self.device_ip_addr
         self._force_ip_attempted = True
         device_info = self._find_first_gev_device_info(prefer_ip=target_ip)
@@ -476,7 +478,7 @@ class LineScanCamera:
             self._force_ip_message = f"already configured: {target_ip}"
             return True
 
-        result = self._eb.PvDeviceGEV.SetIPConfiguration(mac, target_ip, subnet_mask, gateway)
+        result = eb.PvDeviceGEV.SetIPConfiguration(mac, target_ip, subnet_mask, gateway)
         if not _result_ok(result):
             raise EBusResultError(
                 f"force_ip failed for MAC {mac} -> {target_ip}: {_describe_result(result)}"
@@ -572,7 +574,8 @@ class LineScanCamera:
     @property
     def device_link_speed(self) -> int | str:
         """`DeviceLinkSpeed` read-only link speed 확인값."""
-        return self._read_feature("DeviceLinkSpeed")
+        value = self._read_feature("DeviceLinkSpeed")
+        return value if isinstance(value, (int, str)) else str(value)
 
     @property
     def height(self) -> int:
@@ -597,9 +600,9 @@ class LineScanCamera:
         """device/stream handle이 열린 상태인지 반환합니다."""
         return self._is_open
 
-    def settings_snapshot(self) -> dict[str, Any]:
+    def settings_snapshot(self) -> dict[str, object]:
         """현재 wrapper 설정과 가능한 GenICam 값을 dict로 반환합니다."""
-        snapshot: dict[str, Any] = {
+        snapshot: dict[str, object] = {
             "device_ip_addr": self.device_ip_addr,
             "pipeline_buffer_count": self.pipeline_buffer_count,
             "timeout_ms": self.timeout_ms,
@@ -627,8 +630,8 @@ class LineScanCamera:
 
     # ---- private eBUS helpers: public generic GenICam API로 노출하지 않음 ----
 
-    def _find_first_gev_device_info(self, *, prefer_ip: str | None = None) -> Any | None:
-        system = self._eb.PvSystem()
+    def _find_first_gev_device_info(self, *, prefer_ip: str | None = None) -> eb.PvDeviceInfo | None:
+        system = eb.PvSystem()
         result = system.Find()
         if not _result_ok(result):
             raise EBusResultError(f"PvSystem.Find failed: {_describe_result(result)}")
@@ -638,8 +641,8 @@ class LineScanCamera:
             interface = system.GetInterface(i)
             for j in range(int(interface.GetDeviceCount())):
                 info = interface.GetDeviceInfo(j)
-                is_gev = _is_instance(info, getattr(self._eb, "PvDeviceInfoGEV", None))
-                is_pleora = _is_instance(info, getattr(self._eb, "PvDeviceInfoPleoraProtocol", None))
+                is_gev = isinstance(info, eb.PvDeviceInfoGEV)
+                is_pleora = isinstance(info, eb.PvDeviceInfoPleoraProtocol)
                 has_mac = hasattr(info, "GetMACAddress")
                 if not (is_gev or is_pleora or has_mac):
                     continue
@@ -652,7 +655,7 @@ class LineScanCamera:
     def _configure_gige_stream(self) -> None:
         if self._device is None or self._stream is None:
             raise LineScanError("device/stream is not open")
-        if not _is_instance(self._device, getattr(self._eb, "PvDeviceGEV", None)):
+        if not isinstance(self._device, eb.PvDeviceGEV):
             return
 
         result = self._device.NegotiatePacketSize()
@@ -664,13 +667,13 @@ class LineScanCamera:
         if not _result_ok(result):
             raise EBusResultError(f"SetStreamDestination failed: {_describe_result(result)}")
 
-    def _create_pipeline(self) -> Any:
+    def _create_pipeline(self) -> eb.PvPipeline:
         if self._device is None or self._stream is None:
             raise LineScanError("camera is not open")
         payload_size = int(self._device.GetPayloadSize())
         if payload_size <= 0:
             raise LineScanError(f"invalid payload size: {payload_size}")
-        pipeline = self._eb.PvPipeline(self._stream)
+        pipeline = eb.PvPipeline(self._stream)
         if not pipeline:
             raise LineScanError("PvPipeline creation failed")
         pipeline.SetBufferCount(self.pipeline_buffer_count)
@@ -678,7 +681,7 @@ class LineScanCamera:
         self._pipeline = pipeline
         return pipeline
 
-    def _get_feature(self, name: str) -> Any:
+    def _get_feature(self, name: str) -> eb.PvGenParameter:
         self.open()
         params = self._device.GetParameters()
         param = _get_param(params, name)
@@ -686,7 +689,7 @@ class LineScanCamera:
             raise LineScanError(f"GenICam feature not found: {name}")
         return param
 
-    def _read_feature(self, name: str) -> Any:
+    def _read_feature(self, name: str) -> FeatureValue:
         param = self._get_feature(name)
         try:
             if hasattr(param, "GetValueString"):
@@ -703,7 +706,7 @@ class LineScanCamera:
             raise EBusResultError(f"{name}: GetValue failed: {_describe_result(result)}")
         return value
 
-    def _write_feature(self, name: str, value: Any, *, required: bool = True) -> bool:
+    def _write_feature(self, name: str, value: FeatureValue, *, required: bool = True) -> bool:
         try:
             param = self._get_feature(name)
         except Exception:
@@ -745,9 +748,9 @@ class LineScanCamera:
 
     def _frame_from_buffer(
         self,
-        pvbuffer: Any,
-        result: Any,
-        operational_result: Any,
+        pvbuffer: eb.PvBuffer,
+        result: eb.PvResult,
+        operational_result: eb.PvResult,
         *,
         copy_image: bool,
     ) -> LineScanFrame:
@@ -776,8 +779,8 @@ class LineScanCamera:
     def _print_debug_interval(
         self,
         stats: LineScanStats,
-        frame_rate_param: Any | None,
-        bandwidth_param: Any | None,
+        frame_rate_param: eb.PvGenParameter | None,
+        bandwidth_param: eb.PvGenParameter | None,
         dt: float,
         frames_delta: int,
         bytes_delta: int,
@@ -798,12 +801,7 @@ class LineScanCamera:
             f"op_err={stats.operational_errors}, ret_err={stats.retrieve_errors}"
         )
 
-    def _maybe_print_debug(self, *args: Any, **kwargs: Any) -> None:
-        # retrieve timeout만 반복되는 trigger-on 상황에서도 호출부를 단순하게 유지하기 위한 hook.
-        return None
-
-
-def _safe_int_call(obj: Any, method_name: str, default: int = 0) -> int:
+def _safe_int_call(obj: eb.PvBuffer | eb.PvImage, method_name: str, default: int = 0) -> int:
     method = getattr(obj, method_name, None)
     if method is None:
         return default
@@ -813,7 +811,7 @@ def _safe_int_call(obj: Any, method_name: str, default: int = 0) -> int:
         return default
 
 
-def _safe_optional_int_call(obj: Any, method_name: str) -> int | None:
+def _safe_optional_int_call(obj: eb.PvBuffer | eb.PvImage, method_name: str) -> int | None:
     method = getattr(obj, method_name, None)
     if method is None:
         return None
@@ -823,7 +821,7 @@ def _safe_optional_int_call(obj: Any, method_name: str) -> int | None:
         return None
 
 
-def _safe_call(obj: Any, method_name: str, default: Any = None) -> Any:
+def _safe_call(obj: eb.PvDeviceInfo, method_name: str, default: str | None = None) -> str | None:
     method = getattr(obj, method_name, None)
     if method is None:
         return default
@@ -833,7 +831,7 @@ def _safe_call(obj: Any, method_name: str, default: Any = None) -> Any:
         return default
 
 
-def _get_param(params: Any, name: str) -> Any | None:
+def _get_param(params: eb.PvGenParameterArray, name: str) -> eb.PvGenParameter | None:
     if params is None:
         return None
     try:
@@ -842,11 +840,11 @@ def _get_param(params: Any, name: str) -> Any | None:
         return None
 
 
-def _result_ok(result: Any) -> bool:
+def _result_ok(result: eb.PvResult | None) -> bool:
     return result is not None and hasattr(result, "IsOK") and bool(result.IsOK())
 
 
-def _result_code(result: Any) -> str | None:
+def _result_code(result: eb.PvResult | None) -> str | None:
     if result is None:
         return None
     if hasattr(result, "GetCodeString"):
@@ -857,7 +855,7 @@ def _result_code(result: Any) -> str | None:
     return None
 
 
-def _describe_result(result: Any) -> str:
+def _describe_result(result: eb.PvResult | None) -> str:
     if result is None:
         return "None"
     code = _result_code(result) or "UNKNOWN"
@@ -870,7 +868,7 @@ def _describe_result(result: Any) -> str:
     return f"{code}: {desc}" if desc else code
 
 
-def _read_numeric_param(param: Any | None) -> float | None:
+def _read_numeric_param(param: eb.PvGenParameter | None) -> float | None:
     if param is None:
         return None
     try:
@@ -882,14 +880,14 @@ def _read_numeric_param(param: Any | None) -> float | None:
     return None
 
 
-def _get_block_id(pvbuffer: Any) -> int | None:
+def _get_block_id(pvbuffer: eb.PvBuffer) -> int | None:
     block_id = _safe_optional_int_call(pvbuffer, "GetBlockID")
     if block_id is None or block_id < 0:
         return None
     return block_id
 
 
-def _extract_image_payload(image: Any, *, copy_image: bool) -> Any:
+def _extract_image_payload(image: eb.PvImage, *, copy_image: bool) -> object:
     data = image.GetDataPointer()
     if not copy_image:
         return data
@@ -918,9 +916,6 @@ def _extract_image_payload(image: Any, *, copy_image: bool) -> Any:
 def _format_optional_float(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1f}"
 
-
-def _is_instance(obj: Any, cls: Any) -> bool:
-    return cls is not None and isinstance(obj, cls)
 
 
 __all__ = [

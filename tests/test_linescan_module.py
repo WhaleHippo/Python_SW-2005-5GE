@@ -1,5 +1,6 @@
 import unittest
 
+import linescan_module as lm
 from linescan_module import LineScanCamera, LineScanStats
 
 
@@ -244,7 +245,8 @@ class FakeEBus:
 class LineScanModuleTests(unittest.TestCase):
     def make_camera(self):
         eb = FakeEBus()
-        cam = LineScanCamera(eb_module=eb, force_ip=False, timeout_ms=1)
+        lm.eb = eb
+        cam = LineScanCamera(force_ip=False, timeout_ms=1)
         return cam, eb
 
     def test_property_mapping_and_gain_selector(self):
