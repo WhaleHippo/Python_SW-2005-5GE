@@ -1,7 +1,34 @@
+import sys
+import types
 import unittest
 
+import numpy as np
+
+# The real Pleora/JAI eBUS binding is only available on camera machines with the
+# vendor runtime installed. Unit tests use fakes, so provide an import stub before
+# importing linescan_module.
+_ebus_stub = types.ModuleType("eBUS")
+for _name in (
+    "PvBuffer",
+    "PvDevice",
+    "PvDeviceGEV",
+    "PvDeviceInfo",
+    "PvDeviceInfoGEV",
+    "PvDeviceInfoPleoraProtocol",
+    "PvGenParameter",
+    "PvGenParameterArray",
+    "PvImage",
+    "PvPipeline",
+    "PvResult",
+    "PvStream",
+    "PvSystem",
+):
+    setattr(_ebus_stub, _name, object)
+sys.modules.setdefault("eBUS", _ebus_stub)
+
 import linescan_module as lm
-from linescan_module import LineScanCamera, LineScanStats
+from linescan_module import CaptureResult, LineScanCamera, LineScanFrame, LineScanStats
+from linescan_gui import capture_result_to_array, frame_to_array
 
 
 class Result:
@@ -290,6 +317,31 @@ class LineScanModuleTests(unittest.TestCase):
         self.assertTrue(eb.stream_freed)
         self.assertTrue(eb.device.disconnected)
         self.assertTrue(eb.device_freed)
+
+    def test_gui_frame_to_array_uses_frame_dimensions(self):
+        frame = LineScanFrame(
+            image=bytes(range(8)),
+            block_id=1,
+            width=4,
+            height=2,
+            acquired_size=8,
+            timestamp_ns=0,
+            ok=True,
+        )
+        array = frame_to_array(frame)
+        np.testing.assert_array_equal(array, np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.uint8))
+
+    def test_gui_capture_result_to_array_stacks_frames_vertically(self):
+        frames = [
+            LineScanFrame(bytes([1, 2, 3, 4]), 1, 2, 2, 4, 0, True),
+            LineScanFrame(bytes([5, 6, 7, 8]), 2, 2, 2, 4, 0, True),
+        ]
+        result = CaptureResult(frames=frames, stats=LineScanStats())
+        array = capture_result_to_array(result)
+        np.testing.assert_array_equal(
+            array,
+            np.array([[1, 2], [3, 4], [5, 6], [7, 8]], dtype=np.uint8),
+        )
 
 
 if __name__ == "__main__":
