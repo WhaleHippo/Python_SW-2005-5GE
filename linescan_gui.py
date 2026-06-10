@@ -25,6 +25,7 @@ from linescan_module import DEVICE_IP_ADDR, CaptureResult, LineScanCamera, LineS
 
 TRIGGER_MODE_ITEMS = ["Off", "On"]
 TRIGGER_SOURCE_ITEMS = ["Line4", "Software", "Line1", "Line2", "Line3", "Line5", "Line6"]
+FRAME_HEIGHT_ITEMS = ["1", "2", "4", "8", "16", "32", "64", "128"]
 BASE_EXPOSURE_US_MIN = 1
 BASE_EXPOSURE_US_MAX = 1000
 BASE_LINE_RATE_HZ_MIN = 100
@@ -131,6 +132,7 @@ class CaptureSettings:
     line_rate_hz: float
     trigger_mode: str
     trigger_source: str
+    frame_height: int
     duration_s: float
 
 
@@ -208,6 +210,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self.progress.emit("카메라 설정 적용 중...")
                 self.camera.exposure_time = self.settings.exposure_us
                 self.camera.acquisition_line_rate = self.settings.line_rate_hz
+                self.camera.height = self.settings.frame_height
                 self.camera.trigger_mode = self.settings.trigger_mode == "On"
                 if self.settings.trigger_mode == "On":
                     self.camera.trigger_selector = "LineStart"
@@ -278,6 +281,12 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self.trigger_source_combo = QtWidgets.QComboBox()
             self.trigger_source_combo.addItems(TRIGGER_SOURCE_ITEMS)
             form.addWidget(self.trigger_source_combo)
+
+            form.addWidget(QtWidgets.QLabel("Frame height"))
+            self.frame_height_combo = QtWidgets.QComboBox()
+            self.frame_height_combo.addItems(FRAME_HEIGHT_ITEMS)
+            self.frame_height_combo.setCurrentText("128")
+            form.addWidget(self.frame_height_combo)
 
             form.addWidget(QtWidgets.QLabel("Capture duration (s)"))
             self.duration_spin = QtWidgets.QDoubleSpinBox()
@@ -361,6 +370,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self.exposure_slider,
                 self.line_rate_slider,
                 self.trigger_mode_combo,
+                self.frame_height_combo,
                 self.duration_spin,
                 self.capture_button,
             )
@@ -421,6 +431,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 line_rate_hz=float(self.line_rate_slider.value()),
                 trigger_mode=self.trigger_mode_combo.currentText(),
                 trigger_source=self.trigger_source_combo.currentText(),
+                frame_height=int(self.frame_height_combo.currentText()),
                 duration_s=float(self.duration_spin.value()),
             )
 
@@ -430,6 +441,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             settings = self._settings()
             self.camera.exposure_time = settings.exposure_us
             self.camera.acquisition_line_rate = settings.line_rate_hz
+            self.camera.height = settings.frame_height
             self.camera.trigger_mode = settings.trigger_mode == "On"
             if settings.trigger_mode == "On":
                 self.camera.trigger_selector = "LineStart"
