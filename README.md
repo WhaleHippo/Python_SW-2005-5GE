@@ -26,7 +26,7 @@ uv pip install -r requirements-gui.txt
 python linescan_gui.py
 ```
 
-GUI 왼쪽 패널에서 카메라 open/close, 노출 시간, line rate, trigger mode/source, capture duration을 설정하고 `Capture`를 누르면 `linescan_module.py`의 `LineScanCamera.capture()` 결과 bytes를 NumPy 2차원 `uint8` array로 변환해 오른쪽 패널에 grayscale로 표시합니다.
+GUI 왼쪽 패널에서 카메라 open/close, 노출 시간, line rate, trigger mode/source, capture duration을 설정하고 `Capture`를 누르면 `linescan_module.py`의 `LineScanCamera.capture()` 결과 bytes를 NumPy 2차원 `uint8` array로 변환해 오른쪽 패널에 grayscale로 표시합니다. 카메라가 open되기 전에는 설정/캡처 위젯이 비활성화되며, trigger source는 trigger mode가 `On`일 때만 활성화됩니다. 노출 시간과 line rate slider는 `line period = 1 / line rate` 관계에 맞춰 서로의 최대값을 자동 제한합니다.
     
 # 자료 출처
 https://www.jai.com/support-software/jai-software

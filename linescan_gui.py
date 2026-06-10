@@ -25,6 +25,52 @@ from linescan_module import DEVICE_IP_ADDR, CaptureResult, LineScanCamera, LineS
 
 TRIGGER_MODE_ITEMS = ["Off", "On"]
 TRIGGER_SOURCE_ITEMS = ["Line4", "Software", "Line1", "Line2", "Line3", "Line5", "Line6"]
+BASE_EXPOSURE_US_MIN = 1
+BASE_EXPOSURE_US_MAX = 1000
+BASE_LINE_RATE_HZ_MIN = 100
+BASE_LINE_RATE_HZ_MAX = 100_000
+SECONDS_TO_MICROSECONDS = 1_000_000
+
+
+@dataclass(frozen=True)
+class TimingLimits:
+    exposure_us: int
+    exposure_us_max: int
+    line_rate_hz: int
+    line_rate_hz_max: int
+
+
+def _safe_reciprocal_limit(value: float, base_max: int) -> int:
+    if value <= 0:
+        return base_max
+    return max(1, min(base_max, int(SECONDS_TO_MICROSECONDS // value)))
+
+
+def timing_limits(exposure_us: float, line_rate_hz: float) -> TimingLimits:
+    """Return mutually constrained exposure/line-rate values and maxima.
+
+    A line period is ``1 / line_rate`` seconds, so exposure time cannot be
+    longer than that period. Likewise, a selected exposure time limits the
+    maximum line rate to ``1_000_000 / exposure_us`` Hz.
+    """
+    exposure_us_max = _safe_reciprocal_limit(line_rate_hz, BASE_EXPOSURE_US_MAX)
+    line_rate_hz_max = _safe_reciprocal_limit(exposure_us, BASE_LINE_RATE_HZ_MAX)
+    exposure = max(BASE_EXPOSURE_US_MIN, min(int(round(exposure_us)), exposure_us_max))
+    line_rate = max(BASE_LINE_RATE_HZ_MIN, min(int(round(line_rate_hz)), line_rate_hz_max))
+    return TimingLimits(
+        exposure_us=exposure,
+        exposure_us_max=exposure_us_max,
+        line_rate_hz=line_rate,
+        line_rate_hz_max=line_rate_hz_max,
+    )
+
+
+def controls_enabled_after_open(camera_open: bool) -> bool:
+    return bool(camera_open)
+
+
+def trigger_source_enabled(*, camera_open: bool, trigger_mode: str) -> bool:
+    return bool(camera_open) and trigger_mode == "On"
 
 
 def _coerce_payload_to_uint8(payload: object) -> np.ndarray:
@@ -204,25 +250,28 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
 
             self.exposure_label = QtWidgets.QLabel()
             self.exposure_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-            self.exposure_slider.setRange(1, 1000)
+            self.exposure_slider.setRange(BASE_EXPOSURE_US_MIN, BASE_EXPOSURE_US_MAX)
             self.exposure_slider.setValue(5)
             self.exposure_slider.valueChanged.connect(self._update_exposure_label)
+            self.exposure_slider.valueChanged.connect(self._exposure_changed)
             form.addWidget(self.exposure_label)
             form.addWidget(self.exposure_slider)
 
             self.line_rate_label = QtWidgets.QLabel()
             self.line_rate_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-            self.line_rate_slider.setRange(100, 100000)
+            self.line_rate_slider.setRange(BASE_LINE_RATE_HZ_MIN, BASE_LINE_RATE_HZ_MAX)
             self.line_rate_slider.setSingleStep(100)
             self.line_rate_slider.setPageStep(1000)
             self.line_rate_slider.setValue(84000)
             self.line_rate_slider.valueChanged.connect(self._update_line_rate_label)
+            self.line_rate_slider.valueChanged.connect(self._line_rate_changed)
             form.addWidget(self.line_rate_label)
             form.addWidget(self.line_rate_slider)
 
             form.addWidget(QtWidgets.QLabel("Trigger mode"))
             self.trigger_mode_combo = QtWidgets.QComboBox()
             self.trigger_mode_combo.addItems(TRIGGER_MODE_ITEMS)
+            self.trigger_mode_combo.currentTextChanged.connect(self._update_control_enabled_state)
             form.addWidget(self.trigger_mode_combo)
 
             form.addWidget(QtWidgets.QLabel("Trigger source"))
@@ -255,8 +304,11 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self.image_view = ImageView()
             root.addWidget(self.image_view, stretch=1)
 
+            self._timing_update_in_progress = False
             self._update_exposure_label(self.exposure_slider.value())
             self._update_line_rate_label(self.line_rate_slider.value())
+            self._exposure_changed(self.exposure_slider.value())
+            self._update_control_enabled_state()
 
         def closeEvent(self, event):  # noqa: N802 - Qt override
             self._close_camera()
@@ -267,6 +319,64 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
 
         def _update_line_rate_label(self, value: int) -> None:
             self.line_rate_label.setText(f"Line rate: {value:,} Hz")
+
+        def _exposure_changed(self, value: int) -> None:
+            if self._timing_update_in_progress:
+                return
+            self._timing_update_in_progress = True
+            try:
+                max_line_rate = _safe_reciprocal_limit(value, BASE_LINE_RATE_HZ_MAX)
+                self.line_rate_slider.setMaximum(max(BASE_LINE_RATE_HZ_MIN, max_line_rate))
+                if self.line_rate_slider.value() > self.line_rate_slider.maximum():
+                    self.line_rate_slider.setValue(self.line_rate_slider.maximum())
+                max_exposure = _safe_reciprocal_limit(
+                    self.line_rate_slider.value(), BASE_EXPOSURE_US_MAX
+                )
+                self.exposure_slider.setMaximum(max(BASE_EXPOSURE_US_MIN, max_exposure))
+            finally:
+                self._timing_update_in_progress = False
+            self._update_exposure_label(self.exposure_slider.value())
+            self._update_line_rate_label(self.line_rate_slider.value())
+
+        def _line_rate_changed(self, value: int) -> None:
+            if self._timing_update_in_progress:
+                return
+            self._timing_update_in_progress = True
+            try:
+                max_exposure = _safe_reciprocal_limit(value, BASE_EXPOSURE_US_MAX)
+                self.exposure_slider.setMaximum(max(BASE_EXPOSURE_US_MIN, max_exposure))
+                if self.exposure_slider.value() > self.exposure_slider.maximum():
+                    self.exposure_slider.setValue(self.exposure_slider.maximum())
+                max_line_rate = _safe_reciprocal_limit(
+                    self.exposure_slider.value(), BASE_LINE_RATE_HZ_MAX
+                )
+                self.line_rate_slider.setMaximum(max(BASE_LINE_RATE_HZ_MIN, max_line_rate))
+            finally:
+                self._timing_update_in_progress = False
+            self._update_exposure_label(self.exposure_slider.value())
+            self._update_line_rate_label(self.line_rate_slider.value())
+
+        def _control_widgets(self):
+            return (
+                self.exposure_slider,
+                self.line_rate_slider,
+                self.trigger_mode_combo,
+                self.duration_spin,
+                self.capture_button,
+            )
+
+        def _update_control_enabled_state(self) -> None:
+            camera_open = self.camera is not None and self.camera.is_open
+            controls_enabled = controls_enabled_after_open(camera_open)
+            capture_running = self.capture_thread is not None and self.capture_thread.isRunning()
+            for widget in self._control_widgets():
+                widget.setEnabled(controls_enabled and not capture_running)
+            self.trigger_source_combo.setEnabled(
+                trigger_source_enabled(
+                    camera_open=camera_open and not capture_running,
+                    trigger_mode=self.trigger_mode_combo.currentText(),
+                )
+            )
 
         def toggle_camera(self) -> None:
             if self.camera is not None and self.camera.is_open:
@@ -283,7 +393,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 )
                 self.camera.open()
                 self.open_close_button.setText("Close Camera")
-                self.capture_button.setEnabled(True)
+                self._update_control_enabled_state()
                 self.status_label.setText(f"연결됨: {DEVICE_IP_ADDR}")
                 self._apply_current_settings()
             except Exception as exc:
@@ -302,7 +412,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                     pass
             self.camera = None
             self.open_close_button.setText("Open Camera")
-            self.capture_button.setEnabled(False)
+            self._update_control_enabled_state()
             self.status_label.setText("카메라가 닫혀 있습니다.")
 
         def _settings(self) -> CaptureSettings:
@@ -335,6 +445,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
 
             self.capture_button.setEnabled(False)
             self.open_close_button.setEnabled(False)
+            self._update_control_enabled_state()
             self.summary_text.clear()
 
             self.capture_thread = QtCore.QThread(self)
@@ -350,10 +461,10 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
 
         @QtCore.Slot(object, object)
         def _capture_finished(self, result: CaptureResult | None, error_text: str | None) -> None:
-            self.capture_button.setEnabled(self.camera is not None and self.camera.is_open)
             self.open_close_button.setEnabled(True)
             self.capture_thread = None
             self.capture_worker = None
+            self._update_control_enabled_state()
 
             if error_text:
                 self.status_label.setText("Capture 실패")
