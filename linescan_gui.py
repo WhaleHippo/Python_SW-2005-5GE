@@ -28,7 +28,7 @@ TRIGGER_SOURCE_ITEMS = ["Line4", "Software", "Line1", "Line2", "Line3", "Line5",
 FRAME_HEIGHT_ITEMS = ["1", "2", "4", "8", "16", "32", "64", "128"]
 BASE_EXPOSURE_US_MIN = 1
 BASE_EXPOSURE_US_MAX = 1000
-BASE_LINE_RATE_HZ_MIN = 100
+BASE_LINE_RATE_HZ_MIN = 1
 BASE_LINE_RATE_HZ_MAX = 100_000
 SECONDS_TO_MICROSECONDS = 1_000_000
 
@@ -265,7 +265,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self.line_rate_slider.setRange(BASE_LINE_RATE_HZ_MIN, BASE_LINE_RATE_HZ_MAX)
             self.line_rate_slider.setSingleStep(100)
             self.line_rate_slider.setPageStep(1000)
-            self.line_rate_slider.setValue(84000)
+            self.line_rate_slider.setValue(66)
             self.line_rate_slider.valueChanged.connect(self._update_line_rate_label)
             self.line_rate_slider.valueChanged.connect(self._line_rate_changed)
             form.addWidget(self.line_rate_label)
@@ -285,7 +285,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             form.addWidget(QtWidgets.QLabel("Frame height"))
             self.frame_height_combo = QtWidgets.QComboBox()
             self.frame_height_combo.addItems(FRAME_HEIGHT_ITEMS)
-            self.frame_height_combo.setCurrentText("128")
+            self.frame_height_combo.setCurrentText("1")
             form.addWidget(self.frame_height_combo)
 
             form.addWidget(QtWidgets.QLabel("Capture duration (s)"))
