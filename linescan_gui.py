@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -136,6 +137,31 @@ class CaptureSettings:
     duration_s: float
 
 
+def _format_filename_number(value: float, unit: str) -> str:
+    number = f"{value:g}".replace(".", "p")
+    return f"{number}{unit}"
+
+
+def _safe_filename_part(value: str) -> str:
+    return "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in value)
+
+
+def next_capture_image_path(captures_dir: Path, settings: CaptureSettings) -> Path:
+    """Return the next auto-numbered capture image path for the given settings."""
+    next_number = 1
+    if captures_dir.exists():
+        for path in captures_dir.glob("*.png"):
+            number_text = path.stem.split("_", 1)[0]
+            if number_text.isdigit():
+                next_number = max(next_number, int(number_text) + 1)
+
+    exposure = _format_filename_number(settings.exposure_us, "us")
+    line_rate = _format_filename_number(settings.line_rate_hz, "hz")
+    trigger_mode = _safe_filename_part(settings.trigger_mode)
+    filename = f"{next_number}_exposure_{exposure}_linerate_{line_rate}_trigger_{trigger_mode}.png"
+    return captures_dir / filename
+
+
 def load_qt():
     """Import PySide6 lazily so helper functions can be unit-tested headlessly."""
     try:
@@ -162,14 +188,19 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self.customContextMenuRequested.connect(self._show_context_menu)
             self._array = np.empty((0, 0), dtype=np.uint8)
             self._pixmap = QtGui.QPixmap()
+            self._capture_settings: CaptureSettings | None = None
+            self._captures_dir = Path(__file__).resolve().parent / "captures"
 
-        def set_array(self, array: np.ndarray) -> None:
+        def set_array(self, array: np.ndarray, settings: CaptureSettings | None = None) -> None:
             self._array = np.asarray(array, dtype=np.uint8)
             if self._array.size == 0 or self._array.ndim != 2:
                 self._pixmap = QtGui.QPixmap()
+                self._capture_settings = None
                 self.clear()
                 self.setText("표시할 capture 데이터가 없습니다.")
                 return
+
+            self._capture_settings = settings
 
             height, width = self._array.shape
             contiguous = np.ascontiguousarray(self._array)
@@ -207,15 +238,26 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 QtWidgets.QMessageBox.information(self, "이미지 저장", "저장할 이미지가 없습니다.")
                 return
 
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self,
-                "이미지 저장",
-                "capture.png",
-                "PNG Images (*.png);;JPEG Images (*.jpg *.jpeg);;Bitmap Images (*.bmp);;All Files (*)",
-            )
-            if not path:
+            if self._capture_settings is None:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "이미지 저장 실패",
+                    "이미지 저장에 필요한 capture 설정 정보가 없습니다.",
+                )
                 return
-            if not self._pixmap.save(path):
+
+            try:
+                self._captures_dir.mkdir(parents=True, exist_ok=True)
+                path = next_capture_image_path(self._captures_dir, self._capture_settings)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "이미지 저장 실패",
+                    f"저장 경로를 만들 수 없습니다:\n{exc}",
+                )
+                return
+
+            if not self._pixmap.save(str(path)):
                 QtWidgets.QMessageBox.warning(self, "이미지 저장 실패", f"이미지를 저장할 수 없습니다:\n{path}")
                 return
             QtWidgets.QMessageBox.information(self, "이미지 저장", f"이미지를 저장했습니다:\n{path}")
@@ -548,6 +590,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
         @QtCore.Slot(object, object)
         def _capture_finished(self, result: CaptureResult | None, error_text: str | None) -> None:
             self.open_close_button.setEnabled(True)
+            capture_settings = self.capture_worker.settings if self.capture_worker is not None else None
             self.capture_thread = None
             self.capture_worker = None
             self._update_control_enabled_state()
@@ -561,7 +604,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 return
 
             image_array = capture_result_to_array(result)
-            self.image_view.set_array(image_array)
+            self.image_view.set_array(image_array, capture_settings)
             self.status_label.setText(
                 f"Capture 완료: array shape={tuple(image_array.shape)}, frames={result.stats.frames}"
             )

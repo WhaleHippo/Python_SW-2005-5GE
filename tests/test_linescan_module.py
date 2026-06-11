@@ -1,6 +1,8 @@
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -31,9 +33,11 @@ from linescan_module import CaptureResult, LineScanCamera, LineScanFrame, LineSc
 from linescan_gui import (
     BASE_EXPOSURE_US_MAX,
     BASE_LINE_RATE_HZ_MAX,
+    CaptureSettings,
     capture_result_to_array,
     controls_enabled_after_open,
     frame_to_array,
+    next_capture_image_path,
     timing_limits,
     trigger_source_enabled,
 )
@@ -371,6 +375,26 @@ class LineScanModuleTests(unittest.TestCase):
         self.assertFalse(trigger_source_enabled(camera_open=True, trigger_mode="Off"))
         self.assertFalse(trigger_source_enabled(camera_open=False, trigger_mode="On"))
         self.assertTrue(trigger_source_enabled(camera_open=True, trigger_mode="On"))
+
+    def test_next_capture_image_path_uses_incrementing_number_and_settings(self):
+        settings = CaptureSettings(
+            exposure_us=5.0,
+            line_rate_hz=66.0,
+            trigger_mode="Off",
+            trigger_source="Line4",
+            frame_height=1,
+            duration_s=1.0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            captures_dir = Path(tmpdir)
+            (captures_dir / "1_exposure_5us_linerate_66hz_trigger_Off.png").write_bytes(b"old")
+            path = next_capture_image_path(captures_dir, settings)
+
+        self.assertEqual(
+            path.name,
+            "2_exposure_5us_linerate_66hz_trigger_Off.png",
+        )
 
 
 if __name__ == "__main__":
