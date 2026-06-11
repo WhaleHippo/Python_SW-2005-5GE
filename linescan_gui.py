@@ -31,15 +31,7 @@ BASE_EXPOSURE_US_MIN = 1
 BASE_EXPOSURE_US_MAX = 100
 BASE_LINE_RATE_HZ_MIN = 66
 BASE_LINE_RATE_HZ_MAX = 10_000
-SECONDS_TO_MICROSECONDS = 1_000_000
 SETTINGS_APPLY_DEBOUNCE_MS = 250
-
-
-
-def _safe_reciprocal_limit(value: float, base_max: int) -> int:
-    if value <= 0:
-        return base_max
-    return max(1, min(base_max, int(SECONDS_TO_MICROSECONDS // value)))
 
 
 def controls_enabled_after_open(camera_open: bool) -> bool:
@@ -381,39 +373,13 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
         def _exposure_changed(self, value: int) -> None:
             if self._timing_update_in_progress:
                 return
-            self._timing_update_in_progress = True
-            try:
-                max_line_rate = _safe_reciprocal_limit(value, BASE_LINE_RATE_HZ_MAX)
-                self.line_rate_slider.setMaximum(max(BASE_LINE_RATE_HZ_MIN, max_line_rate))
-                if self.line_rate_slider.value() > self.line_rate_slider.maximum():
-                    self.line_rate_slider.setValue(self.line_rate_slider.maximum())
-                max_exposure = _safe_reciprocal_limit(
-                    self.line_rate_slider.value(), BASE_EXPOSURE_US_MAX
-                )
-                self.exposure_slider.setMaximum(max(BASE_EXPOSURE_US_MIN, max_exposure))
-            finally:
-                self._timing_update_in_progress = False
-            self._update_exposure_label(self.exposure_slider.value())
-            self._update_line_rate_label(self.line_rate_slider.value())
+            self._update_exposure_label(value)
             self._schedule_settings_apply()
 
         def _line_rate_changed(self, value: int) -> None:
             if self._timing_update_in_progress:
                 return
-            self._timing_update_in_progress = True
-            try:
-                max_exposure = _safe_reciprocal_limit(value, BASE_EXPOSURE_US_MAX)
-                self.exposure_slider.setMaximum(max(BASE_EXPOSURE_US_MIN, max_exposure))
-                if self.exposure_slider.value() > self.exposure_slider.maximum():
-                    self.exposure_slider.setValue(self.exposure_slider.maximum())
-                max_line_rate = _safe_reciprocal_limit(
-                    self.exposure_slider.value(), BASE_LINE_RATE_HZ_MAX
-                )
-                self.line_rate_slider.setMaximum(max(BASE_LINE_RATE_HZ_MIN, max_line_rate))
-            finally:
-                self._timing_update_in_progress = False
-            self._update_exposure_label(self.exposure_slider.value())
-            self._update_line_rate_label(self.line_rate_slider.value())
+            self._update_line_rate_label(value)
             self._schedule_settings_apply()
 
         def _trigger_mode_changed(self, *_args) -> None:
@@ -444,6 +410,21 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             except Exception:
                 self.status_label.setText("설정 적용 실패")
                 self.summary_text.setPlainText(traceback.format_exc())
+
+        def _sync_timing_slider_maximums_from_camera(self) -> None:
+            if self.camera is None or not self.camera.is_open:
+                return
+            exposure_max = max(BASE_EXPOSURE_US_MIN, int(self.camera.exposure_time_max))
+            line_rate_max = max(BASE_LINE_RATE_HZ_MIN, int(self.camera.acquisition_line_rate_max))
+
+            self._timing_update_in_progress = True
+            try:
+                self.exposure_slider.setMaximum(exposure_max)
+                self.line_rate_slider.setMaximum(line_rate_max)
+            finally:
+                self._timing_update_in_progress = False
+            self._update_exposure_label(self.exposure_slider.value())
+            self._update_line_rate_label(self.line_rate_slider.value())
 
         def _control_widgets(self):
             return (
@@ -526,6 +507,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             if settings.trigger_mode == "On":
                 self.camera.trigger_selector = "LineStart"
                 self.camera.trigger_source = settings.trigger_source
+            self._sync_timing_slider_maximums_from_camera()
 
         def start_capture(self) -> None:
             if self.camera is None or not self.camera.is_open:
