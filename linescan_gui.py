@@ -32,6 +32,7 @@ BASE_EXPOSURE_US_MAX = 1000
 BASE_LINE_RATE_HZ_MIN = 1
 BASE_LINE_RATE_HZ_MAX = 100_000
 SECONDS_TO_MICROSECONDS = 1_000_000
+SETTINGS_APPLY_DEBOUNCE_MS = 250
 
 
 @dataclass(frozen=True)
@@ -297,6 +298,9 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self.camera: LineScanCamera | None = None
             self.capture_thread: QtCore.QThread | None = None
             self.capture_worker: CaptureWorker | None = None
+            self._settings_apply_timer = QtCore.QTimer(self)
+            self._settings_apply_timer.setSingleShot(True)
+            self._settings_apply_timer.timeout.connect(self._apply_pending_settings)
 
             central = QtWidgets.QWidget()
             self.setCentralWidget(central)
@@ -335,18 +339,20 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             form.addWidget(QtWidgets.QLabel("Trigger mode"))
             self.trigger_mode_combo = QtWidgets.QComboBox()
             self.trigger_mode_combo.addItems(TRIGGER_MODE_ITEMS)
-            self.trigger_mode_combo.currentTextChanged.connect(self._update_control_enabled_state)
+            self.trigger_mode_combo.currentTextChanged.connect(self._trigger_mode_changed)
             form.addWidget(self.trigger_mode_combo)
 
             form.addWidget(QtWidgets.QLabel("Trigger source"))
             self.trigger_source_combo = QtWidgets.QComboBox()
             self.trigger_source_combo.addItems(TRIGGER_SOURCE_ITEMS)
+            self.trigger_source_combo.currentTextChanged.connect(self._schedule_settings_apply)
             form.addWidget(self.trigger_source_combo)
 
             form.addWidget(QtWidgets.QLabel("Frame height"))
             self.frame_height_combo = QtWidgets.QComboBox()
             self.frame_height_combo.addItems(FRAME_HEIGHT_ITEMS)
             self.frame_height_combo.setCurrentText("1")
+            self.frame_height_combo.currentTextChanged.connect(self._schedule_settings_apply)
             form.addWidget(self.frame_height_combo)
 
             form.addWidget(QtWidgets.QLabel("Capture duration (s)"))
@@ -388,6 +394,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self._update_control_enabled_state()
 
         def closeEvent(self, event):  # noqa: N802 - Qt override
+            self._settings_apply_timer.stop()
             self._close_camera()
             super().closeEvent(event)
 
@@ -414,6 +421,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self._timing_update_in_progress = False
             self._update_exposure_label(self.exposure_slider.value())
             self._update_line_rate_label(self.line_rate_slider.value())
+            self._schedule_settings_apply()
 
         def _line_rate_changed(self, value: int) -> None:
             if self._timing_update_in_progress:
@@ -432,6 +440,36 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self._timing_update_in_progress = False
             self._update_exposure_label(self.exposure_slider.value())
             self._update_line_rate_label(self.line_rate_slider.value())
+            self._schedule_settings_apply()
+
+        def _trigger_mode_changed(self, *_args) -> None:
+            self._update_control_enabled_state()
+            self._schedule_settings_apply()
+
+        def _capture_running(self) -> bool:
+            return self.capture_thread is not None and self.capture_thread.isRunning()
+
+        def _schedule_settings_apply(self, *_args) -> None:
+            if self.camera is None or not self.camera.is_open or self._capture_running():
+                return
+            self._settings_apply_timer.start(SETTINGS_APPLY_DEBOUNCE_MS)
+
+        def _apply_pending_settings(self) -> None:
+            if self.camera is None or not self.camera.is_open or self._capture_running():
+                return
+            try:
+                self._apply_current_settings()
+                settings = self._settings()
+                self.status_label.setText(
+                    "설정 적용됨: "
+                    f"exposure={settings.exposure_us:g} µs, "
+                    f"line_rate={settings.line_rate_hz:g} Hz, "
+                    f"height={settings.frame_height}, "
+                    f"trigger={settings.trigger_mode}"
+                )
+            except Exception:
+                self.status_label.setText("설정 적용 실패")
+                self.summary_text.setPlainText(traceback.format_exc())
 
         def _control_widgets(self):
             return (
@@ -446,7 +484,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
         def _update_control_enabled_state(self) -> None:
             camera_open = self.camera is not None and self.camera.is_open
             controls_enabled = controls_enabled_after_open(camera_open)
-            capture_running = self.capture_thread is not None and self.capture_thread.isRunning()
+            capture_running = self._capture_running()
             for widget in self._control_widgets():
                 widget.setEnabled(controls_enabled and not capture_running)
             self.trigger_source_combo.setEnabled(
@@ -480,6 +518,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self.summary_text.setPlainText(traceback.format_exc())
 
         def _close_camera(self) -> None:
+            self._settings_apply_timer.stop()
             if self.capture_thread is not None and self.capture_thread.isRunning():
                 self.status_label.setText("Capture 중에는 close할 수 없습니다.")
                 return
@@ -523,6 +562,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self.status_label.setText("이미 capture 중입니다.")
                 return
 
+            self._settings_apply_timer.stop()
             self.capture_button.setEnabled(False)
             self.open_close_button.setEnabled(False)
             self._update_control_enabled_state()
