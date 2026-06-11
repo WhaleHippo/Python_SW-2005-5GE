@@ -158,6 +158,8 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self.setAlignment(QtCore.Qt.AlignCenter)
             self.setMinimumSize(640, 480)
             self.setStyleSheet("background: #111; color: #bbb; border: 1px solid #444;")
+            self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            self.customContextMenuRequested.connect(self._show_context_menu)
             self._array = np.empty((0, 0), dtype=np.uint8)
             self._pixmap = QtGui.QPixmap()
 
@@ -165,6 +167,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self._array = np.asarray(array, dtype=np.uint8)
             if self._array.size == 0 or self._array.ndim != 2:
                 self._pixmap = QtGui.QPixmap()
+                self.clear()
                 self.setText("표시할 capture 데이터가 없습니다.")
                 return
 
@@ -183,6 +186,77 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
 
         def resizeEvent(self, event):  # noqa: N802 - Qt override
             super().resizeEvent(event)
+            self._rescale_pixmap()
+
+        def _show_context_menu(self, position) -> None:
+            menu = QtWidgets.QMenu(self)
+            save_action = menu.addAction("이미지 저장")
+            resize_action = menu.addAction("이미지 크기 변경")
+            has_image = not self._pixmap.isNull()
+            save_action.setEnabled(has_image)
+            resize_action.setEnabled(has_image)
+
+            selected_action = menu.exec(self.mapToGlobal(position))
+            if selected_action == save_action:
+                self._save_current_image()
+            elif selected_action == resize_action:
+                self._resize_current_image()
+
+        def _save_current_image(self) -> None:
+            if self._pixmap.isNull():
+                QtWidgets.QMessageBox.information(self, "이미지 저장", "저장할 이미지가 없습니다.")
+                return
+
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "이미지 저장",
+                "capture.png",
+                "PNG Images (*.png);;JPEG Images (*.jpg *.jpeg);;Bitmap Images (*.bmp);;All Files (*)",
+            )
+            if not path:
+                return
+            if not self._pixmap.save(path):
+                QtWidgets.QMessageBox.warning(self, "이미지 저장 실패", f"이미지를 저장할 수 없습니다:\n{path}")
+                return
+            QtWidgets.QMessageBox.information(self, "이미지 저장", f"이미지를 저장했습니다:\n{path}")
+
+        def _resize_current_image(self) -> None:
+            if self._pixmap.isNull():
+                QtWidgets.QMessageBox.information(self, "이미지 크기 변경", "크기를 변경할 이미지가 없습니다.")
+                return
+
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("이미지 크기 변경")
+            layout = QtWidgets.QVBoxLayout(dialog)
+            form = QtWidgets.QFormLayout()
+            layout.addLayout(form)
+
+            width_spin = QtWidgets.QSpinBox()
+            width_spin.setRange(1, 100_000)
+            width_spin.setValue(self._pixmap.width())
+            form.addRow("가로", width_spin)
+
+            height_spin = QtWidgets.QSpinBox()
+            height_spin.setRange(1, 100_000)
+            height_spin.setValue(self._pixmap.height())
+            form.addRow("세로", height_spin)
+
+            buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+            )
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            if dialog.exec() != QtWidgets.QDialog.Accepted:
+                return
+
+            self._pixmap = self._pixmap.scaled(
+                width_spin.value(),
+                height_spin.value(),
+                QtCore.Qt.IgnoreAspectRatio,
+                QtCore.Qt.FastTransformation,
+            )
             self._rescale_pixmap()
 
         def _rescale_pixmap(self) -> None:
