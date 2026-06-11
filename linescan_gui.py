@@ -184,8 +184,6 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self.setAlignment(QtCore.Qt.AlignCenter)
             self.setMinimumSize(640, 480)
             self.setStyleSheet("background: #111; color: #bbb; border: 1px solid #444;")
-            self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-            self.customContextMenuRequested.connect(self._show_context_menu)
             self._array = np.empty((0, 0), dtype=np.uint8)
             self._pixmap = QtGui.QPixmap()
             self._capture_settings: CaptureSettings | None = None
@@ -219,21 +217,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             super().resizeEvent(event)
             self._rescale_pixmap()
 
-        def _show_context_menu(self, position) -> None:
-            menu = QtWidgets.QMenu(self)
-            save_action = menu.addAction("이미지 저장")
-            resize_action = menu.addAction("이미지 크기 변경")
-            has_image = not self._pixmap.isNull()
-            save_action.setEnabled(has_image)
-            resize_action.setEnabled(has_image)
-
-            selected_action = menu.exec(self.mapToGlobal(position))
-            if selected_action == save_action:
-                self._save_current_image()
-            elif selected_action == resize_action:
-                self._resize_current_image()
-
-        def _save_current_image(self) -> None:
+        def save_current_image(self) -> None:
             if self._pixmap.isNull():
                 QtWidgets.QMessageBox.information(self, "이미지 저장", "저장할 이미지가 없습니다.")
                 return
@@ -261,45 +245,6 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 QtWidgets.QMessageBox.warning(self, "이미지 저장 실패", f"이미지를 저장할 수 없습니다:\n{path}")
                 return
             QtWidgets.QMessageBox.information(self, "이미지 저장", f"이미지를 저장했습니다:\n{path}")
-
-        def _resize_current_image(self) -> None:
-            if self._pixmap.isNull():
-                QtWidgets.QMessageBox.information(self, "이미지 크기 변경", "크기를 변경할 이미지가 없습니다.")
-                return
-
-            dialog = QtWidgets.QDialog(self)
-            dialog.setWindowTitle("이미지 크기 변경")
-            layout = QtWidgets.QVBoxLayout(dialog)
-            form = QtWidgets.QFormLayout()
-            layout.addLayout(form)
-
-            width_spin = QtWidgets.QSpinBox()
-            width_spin.setRange(1, 100_000)
-            width_spin.setValue(self._pixmap.width())
-            form.addRow("가로", width_spin)
-
-            height_spin = QtWidgets.QSpinBox()
-            height_spin.setRange(1, 100_000)
-            height_spin.setValue(self._pixmap.height())
-            form.addRow("세로", height_spin)
-
-            buttons = QtWidgets.QDialogButtonBox(
-                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
-            )
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            layout.addWidget(buttons)
-
-            if dialog.exec() != QtWidgets.QDialog.Accepted:
-                return
-
-            self._pixmap = self._pixmap.scaled(
-                width_spin.value(),
-                height_spin.value(),
-                QtCore.Qt.IgnoreAspectRatio,
-                QtCore.Qt.FastTransformation,
-            )
-            self._rescale_pixmap()
 
         def _rescale_pixmap(self) -> None:
             if self._pixmap.isNull():
@@ -426,8 +371,15 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self.summary_text.setMaximumHeight(230)
             form.addWidget(self.summary_text)
 
+            image_panel = QtWidgets.QWidget()
+            image_layout = QtWidgets.QVBoxLayout(image_panel)
+            image_layout.setContentsMargins(0, 0, 0, 0)
             self.image_view = ImageView()
-            root.addWidget(self.image_view, stretch=1)
+            image_layout.addWidget(self.image_view, stretch=1)
+            self.save_image_button = QtWidgets.QPushButton("이미지 저장")
+            self.save_image_button.clicked.connect(self.image_view.save_current_image)
+            image_layout.addWidget(self.save_image_button)
+            root.addWidget(image_panel, stretch=1)
 
             self._timing_update_in_progress = False
             self._update_exposure_label(self.exposure_slider.value())
