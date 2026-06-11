@@ -35,37 +35,11 @@ SECONDS_TO_MICROSECONDS = 1_000_000
 SETTINGS_APPLY_DEBOUNCE_MS = 250
 
 
-@dataclass(frozen=True)
-class TimingLimits:
-    exposure_us: int
-    exposure_us_max: int
-    line_rate_hz: int
-    line_rate_hz_max: int
-
 
 def _safe_reciprocal_limit(value: float, base_max: int) -> int:
     if value <= 0:
         return base_max
     return max(1, min(base_max, int(SECONDS_TO_MICROSECONDS // value)))
-
-
-def timing_limits(exposure_us: float, line_rate_hz: float) -> TimingLimits:
-    """Return mutually constrained exposure/line-rate values and maxima.
-
-    A line period is ``1 / line_rate`` seconds, so exposure time cannot be
-    longer than that period. Likewise, a selected exposure time limits the
-    maximum line rate to ``1_000_000 / exposure_us`` Hz.
-    """
-    exposure_us_max = _safe_reciprocal_limit(line_rate_hz, BASE_EXPOSURE_US_MAX)
-    line_rate_hz_max = _safe_reciprocal_limit(exposure_us, BASE_LINE_RATE_HZ_MAX)
-    exposure = max(BASE_EXPOSURE_US_MIN, min(int(round(exposure_us)), exposure_us_max))
-    line_rate = max(BASE_LINE_RATE_HZ_MIN, min(int(round(line_rate_hz)), line_rate_hz_max))
-    return TimingLimits(
-        exposure_us=exposure,
-        exposure_us_max=exposure_us_max,
-        line_rate_hz=line_rate,
-        line_rate_hz_max=line_rate_hz_max,
-    )
 
 
 def controls_enabled_after_open(camera_open: bool) -> bool:
@@ -504,7 +478,6 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self.camera = LineScanCamera(
                     device_ip_addr=DEVICE_IP_ADDR,
                     copy_frames=True,
-                    force_ip=True,
                     debug=False,
                 )
                 self.camera.open()

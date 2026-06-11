@@ -31,14 +31,11 @@ sys.modules.setdefault("eBUS", _ebus_stub)
 import linescan_module as lm
 from linescan_module import CaptureResult, LineScanCamera, LineScanFrame, LineScanStats
 from linescan_gui import (
-    BASE_EXPOSURE_US_MAX,
-    BASE_LINE_RATE_HZ_MAX,
     CaptureSettings,
     capture_result_to_array,
     controls_enabled_after_open,
     frame_to_array,
     next_capture_image_path,
-    timing_limits,
     trigger_source_enabled,
 )
 
@@ -354,20 +351,6 @@ class LineScanModuleTests(unittest.TestCase):
             array,
             np.array([[1, 2], [3, 4], [5, 6], [7, 8]], dtype=np.uint8),
         )
-
-    def test_gui_timing_limits_keep_exposure_and_line_rate_compatible(self):
-        limits = timing_limits(exposure_us=20, line_rate_hz=84_000)
-        self.assertEqual(limits.exposure_us_max, 11)
-        self.assertEqual(limits.line_rate_hz_max, 50_000)
-        self.assertEqual(limits.exposure_us, 11)
-        self.assertEqual(limits.line_rate_hz, 50_000)
-
-    def test_gui_timing_limits_respect_base_maximums(self):
-        limits = timing_limits(exposure_us=5, line_rate_hz=1_000)
-        self.assertEqual(limits.exposure_us_max, BASE_EXPOSURE_US_MAX)
-        self.assertEqual(limits.line_rate_hz_max, BASE_LINE_RATE_HZ_MAX)
-        self.assertEqual(limits.exposure_us, 5)
-        self.assertEqual(limits.line_rate_hz, 1_000)
 
     def test_gui_controls_are_enabled_only_after_open_and_trigger_source_needs_trigger_on(self):
         self.assertFalse(controls_enabled_after_open(False))
