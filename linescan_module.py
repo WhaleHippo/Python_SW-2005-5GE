@@ -545,6 +545,16 @@ class LineScanCamera:
         self._write_feature("ExposureTime", float(value))
 
     @property
+    def exposure_time_max(self) -> float:
+        """`ExposureTime.GetMax()`에서 읽은 노출 시간 최대값(µs)."""
+        return self._read_feature_max("ExposureTime")
+
+    @property
+    def exposure_time_min(self) -> float:
+        """`ExposureTime.GetMin()`에서 읽은 노출 시간 최소값(µs)."""
+        return self._read_feature_min("ExposureTime")
+
+    @property
     def acquisition_line_rate(self) -> float:
         """`AcquisitionLineRate` 내부 line-rate(Hz). TriggerMode=Off에서 의미가 큽니다."""
         return float(self._read_feature("AcquisitionLineRate"))
@@ -552,6 +562,16 @@ class LineScanCamera:
     @acquisition_line_rate.setter
     def acquisition_line_rate(self, value: float) -> None:
         self._write_feature("AcquisitionLineRate", float(value))
+
+    @property
+    def acquisition_line_rate_max(self) -> float:
+        """`AcquisitionLineRate.GetMax()`에서 읽은 내부 line-rate 최대값(Hz)."""
+        return self._read_feature_max("AcquisitionLineRate")
+
+    @property
+    def acquisition_line_rate_min(self) -> float:
+        """`AcquisitionLineRate.GetMin()`에서 읽은 내부 line-rate 최소값(Hz)."""
+        return self._read_feature_min("AcquisitionLineRate")
 
     @property
     def gev_scps_packet_size(self) -> int:
@@ -705,6 +725,25 @@ class LineScanCamera:
         if not _result_ok(result):
             raise EBusResultError(f"{name}: GetValue failed: {_describe_result(result)}")
         return value
+
+    def _read_feature_limit(self, name: str, method_name: str) -> float:
+        param = self._get_feature(name)
+        method = getattr(param, method_name, None)
+        if method is None:
+            raise LineScanError(f"{name}: {method_name} is not available")
+        try:
+            result, value = method()
+        except Exception as exc:
+            raise LineScanError(f"{name}: {method_name} raised {exc}") from exc
+        if not _result_ok(result):
+            raise EBusResultError(f"{name}: {method_name} failed: {_describe_result(result)}")
+        return float(value)
+
+    def _read_feature_min(self, name: str) -> float:
+        return self._read_feature_limit(name, "GetMin")
+
+    def _read_feature_max(self, name: str) -> float:
+        return self._read_feature_limit(name, "GetMax")
 
     def _write_feature(self, name: str, value: FeatureValue, *, required: bool = True) -> bool:
         try:

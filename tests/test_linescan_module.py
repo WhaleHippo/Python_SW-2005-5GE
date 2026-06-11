@@ -57,8 +57,10 @@ class Result:
 
 
 class Param:
-    def __init__(self, value=None):
+    def __init__(self, value=None, minimum=None, maximum=None):
         self.value = value
+        self.minimum = minimum
+        self.maximum = maximum
         self.writes = []
         self.exec_count = 0
 
@@ -67,6 +69,12 @@ class Param:
 
     def GetValueString(self):
         return Result(), str(self.value)
+
+    def GetMin(self):
+        return Result(), self.minimum
+
+    def GetMax(self):
+        return Result(), self.maximum
 
     def SetValue(self, value):
         self.value = value
@@ -87,8 +95,8 @@ class Params:
             "TriggerActivation": Param("RisingEdge"),
             "GainSelector": Param("AnalogAll"),
             "Gain": Param(1.0),
-            "ExposureTime": Param(5.0),
-            "AcquisitionLineRate": Param(84000.0),
+            "ExposureTime": Param(5.0, minimum=1.0, maximum=100.0),
+            "AcquisitionLineRate": Param(84000.0, minimum=66.0, maximum=10000.0),
             "GevSCPSPacketSize": Param(7976),
             "NetworkThroughputSafetyMargin": Param(92),
             "DeviceLinkSpeed": Param(5000000000),
@@ -300,6 +308,14 @@ class LineScanModuleTests(unittest.TestCase):
         self.assertEqual(cam.width, 2048)
         with self.assertRaises(AttributeError):
             cam.device_link_speed = 1  # type: ignore[misc]
+
+    def test_timing_feature_limits_are_exposed_as_float_properties(self):
+        cam, _eb = self.make_camera()
+        cam.open()
+        self.assertEqual(cam.acquisition_line_rate_min, 66.0)
+        self.assertEqual(cam.acquisition_line_rate_max, 10000.0)
+        self.assertEqual(cam.exposure_time_min, 1.0)
+        self.assertEqual(cam.exposure_time_max, 100.0)
 
     def test_stats_block_gap(self):
         stats = LineScanStats()
