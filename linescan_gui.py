@@ -387,7 +387,13 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self._exposure_changed(self.exposure_slider.value())
             self._update_control_enabled_state()
 
+            self.settings_apply_timer = QtCore.QTimer(self)
+            self.settings_apply_timer.setInterval(1000)
+            self.settings_apply_timer.timeout.connect(self._apply_current_settings_periodically)
+            self.settings_apply_timer.start()
+
         def closeEvent(self, event):  # noqa: N802 - Qt override
+            self.settings_apply_timer.stop()
             self._close_camera()
             super().closeEvent(event)
 
@@ -514,6 +520,17 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             if settings.trigger_mode == "On":
                 self.camera.trigger_selector = "LineStart"
                 self.camera.trigger_source = settings.trigger_source
+
+        def _apply_current_settings_periodically(self) -> None:
+            camera_open = self.camera is not None and self.camera.is_open
+            capture_running = self.capture_thread is not None and self.capture_thread.isRunning()
+            if not camera_open or capture_running:
+                return
+            try:
+                self._apply_current_settings()
+            except Exception as exc:
+                self.status_label.setText(f"설정 적용 실패: {exc}")
+                self.summary_text.setPlainText(traceback.format_exc())
 
         def start_capture(self) -> None:
             if self.camera is None or not self.camera.is_open:
