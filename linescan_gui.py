@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, Queue
+from typing import Any, Callable
 
 import numpy as np
-
-from linescan_module import DEVICE_IP_ADDR, CaptureResult, LineScanCamera, LineScanFrame
 
 
 TRIGGER_MODE_ITEMS = ["Off", "On"]
@@ -34,6 +34,8 @@ BASE_LINE_RATE_HZ_MAX = 10_000
 SETTINGS_APPLY_DEBOUNCE_MS = 250
 SETTINGS_SETTLE_MS = 1000
 """Time to wait after applying camera settings before enabling capture."""
+DEFAULT_DEVICE_IP_ADDR = "192.168.1.200"
+"""Default camera IP used by the GUI. The camera service imports linescan_module lazily."""
 
 
 def controls_enabled_after_open(camera_open: bool) -> bool:
@@ -66,7 +68,7 @@ def _coerce_payload_to_uint8(payload: object) -> np.ndarray:
     return np.empty((0,), dtype=np.uint8)
 
 
-def frame_to_array(frame: LineScanFrame) -> np.ndarray:
+def frame_to_array(frame: Any) -> np.ndarray:
     """Convert one LineScanFrame's grayscale bytes into a 2D numpy array.
 
     Width/height metadata from the camera is preferred. If height is missing but
@@ -88,7 +90,7 @@ def frame_to_array(frame: LineScanFrame) -> np.ndarray:
     return payload.reshape(1, -1).copy()
 
 
-def capture_result_to_array(result: CaptureResult) -> np.ndarray:
+def capture_result_to_array(result: Any) -> np.ndarray:
     """Stack captured grayscale frames vertically into one 2D image array."""
     arrays = [arr for arr in (frame_to_array(frame) for frame in result.frames) if arr.size]
     if not arrays:
@@ -113,9 +115,150 @@ class CaptureSettings:
 
 @dataclass(frozen=True)
 class GuiCapturePayload:
-    result: CaptureResult
+    result: Any
     image_array: np.ndarray
     preview_bytes: int
+
+
+@dataclass(frozen=True)
+class CameraCommand:
+    """Plain camera command message usable by QThread today and a Process later."""
+
+    action: str
+    settings: CaptureSettings | None = None
+    command_id: int = 0
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CameraEvent:
+    """Plain camera event message emitted from the isolated camera service."""
+
+    kind: str
+    command_id: int = 0
+    payload: Any = None
+    error_text: str | None = None
+
+
+class CameraServiceCore:
+    """Own the full eBUS camera lifecycle without depending on Qt widgets.
+
+    This class is intentionally plain Python: the GUI sends ``CameraCommand``
+    messages and receives ``CameraEvent`` messages.  The current GUI runs it in
+    one QThread, but the same command/event boundary can later be moved into a
+    multiprocessing/subprocess worker without passing Qt or eBUS objects across
+    the boundary.
+    """
+
+    def __init__(
+        self,
+        *,
+        camera_factory: Callable[[], Any] | None = None,
+        device_ip_addr: str = DEFAULT_DEVICE_IP_ADDR,
+    ):
+        self._camera_factory = camera_factory
+        self.device_ip_addr = device_ip_addr
+        self.camera: Any | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return bool(self.camera is not None and getattr(self.camera, "is_open", False))
+
+    def handle(self, command: CameraCommand) -> list[CameraEvent]:
+        try:
+            if command.action == "open":
+                return [self._open(command)]
+            if command.action == "config":
+                return [self._config(command)]
+            if command.action == "capture":
+                return self._capture(command)
+            if command.action == "close":
+                return [self._close(command)]
+            if command.action == "shutdown":
+                event = self._close(command)
+                return [CameraEvent("shutdown", command.command_id, event.payload)]
+            raise ValueError(f"unknown camera command: {command.action}")
+        except Exception:
+            return [CameraEvent("error", command.command_id, error_text=traceback.format_exc())]
+
+    def _make_camera(self) -> Any:
+        if self._camera_factory is not None:
+            return self._camera_factory()
+        from linescan_module import LineScanCamera
+
+        return LineScanCamera(device_ip_addr=self.device_ip_addr, copy_frames=True, debug=False)
+
+    def _open(self, command: CameraCommand) -> CameraEvent:
+        if self.camera is None:
+            self.camera = self._make_camera()
+        self.camera.open()
+        if command.settings is not None:
+            self._apply_settings(command.settings)
+        return CameraEvent("opened", command.command_id, self._camera_info())
+
+    def _config(self, command: CameraCommand) -> CameraEvent:
+        self._require_open()
+        if command.settings is None:
+            raise ValueError("config command requires settings")
+        self._apply_settings(command.settings)
+        return CameraEvent("config_applied", command.command_id, self._camera_info())
+
+    def _capture(self, command: CameraCommand) -> list[CameraEvent]:
+        self._require_open()
+        if command.settings is None:
+            raise ValueError("capture command requires settings")
+        accumulator = DisplayImageAccumulator()
+
+        def on_frame(frame: Any) -> None:
+            # Convert while the eBUS pipeline buffer is still checked out.
+            accumulator.add_frame(frame)
+
+        started = CameraEvent("capture_started", command.command_id, command.settings)
+        result = self.camera.capture(
+            duration_s=command.settings.duration_s,
+            store_frames=False,
+            copy_frames=True,
+            on_frame=on_frame,
+            debug=False,
+        )
+        payload = GuiCapturePayload(
+            result=result,
+            image_array=accumulator.to_array(),
+            preview_bytes=accumulator.bytes_used,
+        )
+        return [started, CameraEvent("capture_finished", command.command_id, payload)]
+
+    def _close(self, command: CameraCommand) -> CameraEvent:
+        if self.camera is not None:
+            try:
+                self.camera.close()
+            finally:
+                self.camera = None
+        return CameraEvent("closed", command.command_id, {"device_ip_addr": self.device_ip_addr})
+
+    def _require_open(self) -> None:
+        if self.camera is None or not getattr(self.camera, "is_open", False):
+            raise RuntimeError("camera is not open")
+
+    def _apply_settings(self, settings: CaptureSettings) -> None:
+        self._require_open()
+        self.camera.exposure_time = settings.exposure_us
+        self.camera.acquisition_line_rate = settings.line_rate_hz
+        self.camera.height = settings.frame_height
+        self.camera.trigger_mode = settings.trigger_mode == "On"
+        if settings.trigger_mode == "On":
+            self.camera.trigger_selector = "LineStart"
+            self.camera.trigger_source = settings.trigger_source
+
+    def _camera_info(self) -> dict[str, Any]:
+        info: dict[str, Any] = {"device_ip_addr": self.device_ip_addr, "is_open": self.is_open}
+        if self.camera is not None:
+            for key in ("exposure_time_max", "acquisition_line_rate_max"):
+                try:
+                    info[key] = float(getattr(self.camera, key))
+                except Exception:
+                    pass
+        return info
 
 
 class DisplayImageAccumulator:
@@ -130,7 +273,7 @@ class DisplayImageAccumulator:
     def bytes_used(self) -> int:
         return len(self._data)
 
-    def add_frame(self, frame: LineScanFrame) -> None:
+    def add_frame(self, frame: Any) -> None:
         array = frame_to_array(frame)
         if array.size == 0 or array.ndim != 2 or array.shape[1] <= 0:
             return
@@ -277,50 +420,59 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             )
             self.setPixmap(scaled)
 
-    class CaptureWorker(QtCore.QObject):
-        finished = QtCore.Signal(object, object)  # CaptureResult | None, error_text | None
-        progress = QtCore.Signal(str)
+    class CameraServiceWorker(QtCore.QObject):
+        """Qt adapter around the plain camera service command queue."""
 
-        def __init__(self, camera: LineScanCamera, settings: CaptureSettings):
+        event = QtCore.Signal(object)
+
+        def __init__(self, core: CameraServiceCore | None = None):
             super().__init__()
-            self.camera = camera
-            self.settings = settings
+            self.core = core or CameraServiceCore()
+            self._commands: Queue[CameraCommand] = Queue()
+            self._processing = False
+
+        @QtCore.Slot(object)
+        def submit(self, command: CameraCommand) -> None:
+            self._commands.put(command)
+            self._drain_commands()
 
         @QtCore.Slot()
-        def run(self) -> None:
+        def shutdown_now(self) -> None:
+            for event in self.core.handle(CameraCommand("shutdown")):
+                self.event.emit(event)
+
+        def _drain_commands(self) -> None:
+            if self._processing:
+                return
+            self._processing = True
             try:
-                accumulator = DisplayImageAccumulator()
-
-                def on_frame(frame: LineScanFrame) -> None:
-                    # Convert while the eBUS pipeline buffer is still checked out.
-                    # This avoids later GUI access to a released native pointer.
-                    accumulator.add_frame(frame)
-
-                self.progress.emit(f"{self.settings.duration_s:.3f}초 capture 중...")
-                result = self.camera.capture(
-                    duration_s=self.settings.duration_s,
-                    store_frames=False,
-                    copy_frames=True,
-                    on_frame=on_frame,
-                    debug=False,
-                )
-                payload = GuiCapturePayload(
-                    result=result,
-                    image_array=accumulator.to_array(),
-                    preview_bytes=accumulator.bytes_used,
-                )
-                self.finished.emit(payload, None)
-            except Exception:
-                self.finished.emit(None, traceback.format_exc())
+                while True:
+                    try:
+                        command = self._commands.get_nowait()
+                    except Empty:
+                        break
+                    for event in self.core.handle(command):
+                        self.event.emit(event)
+            finally:
+                self._processing = False
 
     class MainWindow(QtWidgets.QMainWindow):
+        camera_command_requested = QtCore.Signal(object)
+
         def __init__(self):
             super().__init__()
             self.setWindowTitle("SW-2005/4005 5GE Line Scan Capture")
             self.resize(1200, 760)
-            self.camera: LineScanCamera | None = None
-            self.capture_thread: QtCore.QThread | None = None
-            self.capture_worker: CaptureWorker | None = None
+            self.camera_open = False
+            self._camera_busy_action: str | None = None
+            self._command_id = 0
+            self._pending_capture_settings: CaptureSettings | None = None
+            self.camera_thread = QtCore.QThread(self)
+            self.camera_worker = CameraServiceWorker()
+            self.camera_worker.moveToThread(self.camera_thread)
+            self.camera_command_requested.connect(self.camera_worker.submit)
+            self.camera_worker.event.connect(self._camera_event_received)
+            self.camera_thread.start()
             self._settings_apply_timer = QtCore.QTimer(self)
             self._settings_apply_timer.setSingleShot(True)
             self._settings_apply_timer.timeout.connect(self._apply_pending_settings)
@@ -420,9 +572,20 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self._update_control_enabled_state()
 
         def closeEvent(self, event):  # noqa: N802 - Qt override
+            if self._capture_running():
+                self.status_label.setText("Capture 중에는 창을 닫을 수 없습니다.")
+                event.ignore()
+                return
             self._settings_apply_timer.stop()
             self._settings_settle_timer.stop()
-            self._close_camera()
+            if self.camera_thread.isRunning():
+                QtCore.QMetaObject.invokeMethod(
+                    self.camera_worker,
+                    "shutdown_now",
+                    QtCore.Qt.BlockingQueuedConnection,
+                )
+                self.camera_thread.quit()
+                self.camera_thread.wait(2000)
             super().closeEvent(event)
 
         def _update_exposure_label(self, value: int) -> None:
@@ -448,10 +611,24 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self._schedule_settings_apply()
 
         def _capture_running(self) -> bool:
-            return self.capture_thread is not None and self.capture_thread.isRunning()
+            return self._camera_busy_action == "capture"
+
+        def _camera_busy(self) -> bool:
+            return self._camera_busy_action is not None
+
+        def _next_command_id(self) -> int:
+            self._command_id += 1
+            return self._command_id
+
+        def _send_camera_command(self, action: str, settings: CaptureSettings | None = None) -> None:
+            self._camera_busy_action = action
+            self._update_control_enabled_state()
+            self.camera_command_requested.emit(
+                CameraCommand(action=action, settings=settings, command_id=self._next_command_id())
+            )
 
         def _schedule_settings_apply(self, *_args) -> None:
-            if self.camera is None or not self.camera.is_open or self._capture_running():
+            if not self.camera_open or self._camera_busy():
                 return
             self._settings_settle_timer.stop()
             self.capture_button.setEnabled(False)
@@ -459,35 +636,32 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
 
         def _settings_settled(self) -> None:
             self._update_control_enabled_state()
-            if self.camera is not None and self.camera.is_open and not self._capture_running():
+            if self.camera_open and not self._camera_busy():
                 self.status_label.setText("설정 안정화 완료. Capture 가능.")
 
         def _settings_ready_for_capture(self) -> bool:
             return not self._settings_apply_timer.isActive() and not self._settings_settle_timer.isActive()
 
         def _apply_pending_settings(self) -> None:
-            if self.camera is None or not self.camera.is_open or self._capture_running():
+            if not self.camera_open or self._camera_busy():
                 return
-            try:
-                self._apply_current_settings()
-                settings = self._settings()
-                self.status_label.setText(
-                    "설정 적용됨. 1초 안정화 대기 중: "
-                    f"exposure={settings.exposure_us:g} µs, "
-                    f"line_rate={settings.line_rate_hz:g} Hz, "
-                    f"height={settings.frame_height}, "
-                    f"trigger={settings.trigger_mode}"
-                )
-                self._settings_settle_timer.start(SETTINGS_SETTLE_MS)
-            except Exception:
-                self.status_label.setText("설정 적용 실패")
-                self.summary_text.setPlainText(traceback.format_exc())
+            settings = self._settings()
+            self.status_label.setText(
+                "설정 적용 중: "
+                f"exposure={settings.exposure_us:g} µs, "
+                f"line_rate={settings.line_rate_hz:g} Hz, "
+                f"height={settings.frame_height}, "
+                f"trigger={settings.trigger_mode}"
+            )
+            self._send_camera_command("config", settings)
 
-        def _sync_timing_slider_maximums_from_camera(self) -> None:
-            if self.camera is None or not self.camera.is_open:
-                return
-            exposure_max = max(BASE_EXPOSURE_US_MIN, int(self.camera.exposure_time_max))
-            line_rate_max = max(BASE_LINE_RATE_HZ_MIN, int(self.camera.acquisition_line_rate_max))
+        def _sync_timing_slider_maximums_from_camera_info(self, info: dict[str, Any] | None) -> None:
+            info = info or {}
+            exposure_max = max(BASE_EXPOSURE_US_MIN, int(info.get("exposure_time_max", BASE_EXPOSURE_US_MAX)))
+            line_rate_max = max(
+                BASE_LINE_RATE_HZ_MIN,
+                int(info.get("acquisition_line_rate_max", BASE_LINE_RATE_HZ_MAX)),
+            )
 
             self._timing_update_in_progress = True
             try:
@@ -508,60 +682,40 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             )
 
         def _update_control_enabled_state(self) -> None:
-            camera_open = self.camera is not None and self.camera.is_open
-            controls_enabled = controls_enabled_after_open(camera_open)
-            capture_running = self._capture_running()
+            controls_enabled = controls_enabled_after_open(self.camera_open)
+            busy = self._camera_busy()
             for widget in self._control_widgets():
-                widget.setEnabled(controls_enabled and not capture_running)
+                widget.setEnabled(controls_enabled and not busy)
             self.capture_button.setEnabled(
-                controls_enabled and not capture_running and self._settings_ready_for_capture()
+                controls_enabled and not busy and self._settings_ready_for_capture()
             )
+            self.open_close_button.setEnabled(not busy)
             self.trigger_source_combo.setEnabled(
                 trigger_source_enabled(
-                    camera_open=camera_open and not capture_running,
+                    camera_open=self.camera_open and not busy,
                     trigger_mode=self.trigger_mode_combo.currentText(),
                 )
             )
 
         def toggle_camera(self) -> None:
-            if self.camera is not None and self.camera.is_open:
+            if self.camera_open:
                 self._close_camera()
                 return
-            try:
-                self.status_label.setText("카메라 연결 중...")
-                QtWidgets.QApplication.processEvents()
-                self.camera = LineScanCamera(
-                    device_ip_addr=DEVICE_IP_ADDR,
-                    copy_frames=True,
-                    debug=False,
-                )
-                self.camera.open()
-                self.open_close_button.setText("Close Camera")
-                self._update_control_enabled_state()
-                self.status_label.setText(f"연결됨: {DEVICE_IP_ADDR}. 설정 안정화 대기 중...")
-                self._apply_current_settings()
-                self.capture_button.setEnabled(False)
-                self._settings_settle_timer.start(SETTINGS_SETTLE_MS)
-            except Exception as exc:
-                self._close_camera()
-                self.status_label.setText(f"연결 실패: {exc}")
-                self.summary_text.setPlainText(traceback.format_exc())
+            self.status_label.setText("카메라 연결 중...")
+            self.summary_text.clear()
+            self.open_close_button.setEnabled(False)
+            self._send_camera_command("open", self._settings())
 
         def _close_camera(self) -> None:
             self._settings_apply_timer.stop()
             self._settings_settle_timer.stop()
-            if self.capture_thread is not None and self.capture_thread.isRunning():
+            if self._capture_running():
                 self.status_label.setText("Capture 중에는 close할 수 없습니다.")
                 return
-            if self.camera is not None:
-                try:
-                    self.camera.close()
-                except Exception:
-                    pass
-            self.camera = None
-            self.open_close_button.setText("Open Camera")
-            self._update_control_enabled_state()
-            self.status_label.setText("카메라가 닫혀 있습니다.")
+            if not self.camera_open:
+                return
+            self.status_label.setText("카메라 닫는 중...")
+            self._send_camera_command("close")
 
         def _settings(self) -> CaptureSettings:
             return CaptureSettings(
@@ -573,53 +727,111 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 duration_s=float(self.duration_spin.value()),
             )
 
-        def _apply_current_settings(self) -> None:
-            if self.camera is None:
-                return
-            settings = self._settings()
-            self.camera.exposure_time = settings.exposure_us
-            self.camera.acquisition_line_rate = settings.line_rate_hz
-            self.camera.height = settings.frame_height
-            self.camera.trigger_mode = settings.trigger_mode == "On"
-            if settings.trigger_mode == "On":
-                self.camera.trigger_selector = "LineStart"
-                self.camera.trigger_source = settings.trigger_source
-            self._sync_timing_slider_maximums_from_camera()
-
         def start_capture(self) -> None:
-            if self.camera is None or not self.camera.is_open:
+            if not self.camera_open:
                 self.status_label.setText("먼저 카메라를 open 해주세요.")
                 return
-            if self.capture_thread is not None and self.capture_thread.isRunning():
-                self.status_label.setText("이미 capture 중입니다.")
+            if self._camera_busy():
+                self.status_label.setText("카메라 작업이 이미 진행 중입니다.")
                 return
             if not self._settings_ready_for_capture():
                 self.status_label.setText("설정 적용/안정화 중입니다. 잠시 후 capture 해주세요.")
                 return
 
             self._settings_apply_timer.stop()
+            settings = self._settings()
+            self._pending_capture_settings = settings
             self.capture_button.setEnabled(False)
             self.open_close_button.setEnabled(False)
-            self._update_control_enabled_state()
             self.summary_text.clear()
+            self.status_label.setText(f"{settings.duration_s:.3f}초 capture 요청 중...")
+            self._send_camera_command("capture", settings)
 
-            self.capture_thread = QtCore.QThread(self)
-            self.capture_worker = CaptureWorker(self.camera, self._settings())
-            self.capture_worker.moveToThread(self.capture_thread)
-            self.capture_thread.started.connect(self.capture_worker.run)
-            self.capture_worker.progress.connect(self.status_label.setText)
-            self.capture_worker.finished.connect(self._capture_finished)
-            self.capture_worker.finished.connect(self.capture_thread.quit)
-            self.capture_worker.finished.connect(self.capture_worker.deleteLater)
-            self.capture_thread.finished.connect(self.capture_thread.deleteLater)
-            self.capture_thread.start()
+        @QtCore.Slot(object)
+        def _camera_event_received(self, event: CameraEvent) -> None:
+            if event.kind == "opened":
+                self.camera_open = True
+                self._camera_busy_action = None
+                self.open_close_button.setText("Close Camera")
+                self._sync_timing_slider_maximums_from_camera_info(event.payload)
+                self.status_label.setText(
+                    f"연결됨: {event.payload.get('device_ip_addr', DEFAULT_DEVICE_IP_ADDR)}. "
+                    "설정 안정화 대기 중..."
+                )
+                self.capture_button.setEnabled(False)
+                self._settings_settle_timer.start(SETTINGS_SETTLE_MS)
+                self._update_control_enabled_state()
+                return
 
-        @QtCore.Slot(object, object)
-        def _capture_finished(self, payload: GuiCapturePayload | None, error_text: str | None) -> None:
+            if event.kind == "config_applied":
+                self._camera_busy_action = None
+                self._sync_timing_slider_maximums_from_camera_info(event.payload)
+                settings = self._settings()
+                self.status_label.setText(
+                    "설정 적용됨. 1초 안정화 대기 중: "
+                    f"exposure={settings.exposure_us:g} µs, "
+                    f"line_rate={settings.line_rate_hz:g} Hz, "
+                    f"height={settings.frame_height}, "
+                    f"trigger={settings.trigger_mode}"
+                )
+                self.capture_button.setEnabled(False)
+                self._settings_settle_timer.start(SETTINGS_SETTLE_MS)
+                self._update_control_enabled_state()
+                return
+
+            if event.kind == "capture_started":
+                settings = event.payload
+                self.status_label.setText(f"{settings.duration_s:.3f}초 capture 중...")
+                return
+
+            if event.kind == "capture_finished":
+                self._camera_busy_action = None
+                settings = self._pending_capture_settings
+                self._pending_capture_settings = None
+                self._capture_finished(event.payload, None, settings)
+                return
+
+            if event.kind == "closed":
+                self.camera_open = False
+                self._camera_busy_action = None
+                self._pending_capture_settings = None
+                self.open_close_button.setText("Open Camera")
+                self.status_label.setText("카메라가 닫혀 있습니다.")
+                self._update_control_enabled_state()
+                return
+
+            if event.kind == "shutdown":
+                self.camera_open = False
+                self._camera_busy_action = None
+                return
+
+            if event.kind == "error":
+                failed_action = self._camera_busy_action
+                self._camera_busy_action = None
+                if failed_action == "open":
+                    self.camera_open = False
+                    self.open_close_button.setText("Open Camera")
+                    self.status_label.setText("연결 실패")
+                elif failed_action == "config":
+                    self.status_label.setText("설정 적용 실패")
+                elif failed_action == "capture":
+                    self.status_label.setText("Capture 실패")
+                    self._pending_capture_settings = None
+                elif failed_action == "close":
+                    self.status_label.setText("카메라 close 실패")
+                else:
+                    self.status_label.setText("카메라 작업 실패")
+                self.summary_text.setPlainText(str(event.error_text or "unknown error"))
+                self._update_control_enabled_state()
+                return
+
+        def _capture_finished(
+            self,
+            payload: GuiCapturePayload | None,
+            error_text: str | None,
+            capture_settings: CaptureSettings | None,
+        ) -> None:
             self.open_close_button.setEnabled(True)
-            capture_settings = self.capture_worker.settings if self.capture_worker is not None else None
-            self.capture_thread = None
-            self.capture_worker = None
             self._update_control_enabled_state()
 
             if error_text:

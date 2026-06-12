@@ -31,6 +31,8 @@ sys.modules.setdefault("eBUS", _ebus_stub)
 import linescan_module as lm
 from linescan_module import CaptureResult, LineScanCamera, LineScanFrame, LineScanStats
 from linescan_gui import (
+    CameraCommand,
+    CameraServiceCore,
     CaptureSettings,
     DisplayImageAccumulator,
     capture_result_to_array,
@@ -417,6 +419,105 @@ class LineScanModuleTests(unittest.TestCase):
             path.name,
             "2_exposure_5us_linerate_66hz_trigger_Off.png",
         )
+
+    def test_camera_service_core_keeps_camera_lifecycle_inside_service(self):
+        class FakeServiceCamera:
+            def __init__(self):
+                self.is_open = False
+                self.calls = []
+                self.exposure_time_max = 100.0
+                self.acquisition_line_rate_max = 10000.0
+
+            def open(self):
+                self.calls.append("open")
+                self.is_open = True
+                return self
+
+            def close(self):
+                self.calls.append("close")
+                self.is_open = False
+
+            @property
+            def exposure_time(self):
+                return 0.0
+
+            @exposure_time.setter
+            def exposure_time(self, value):
+                self.calls.append(("exposure_time", value))
+
+            @property
+            def acquisition_line_rate(self):
+                return 0.0
+
+            @acquisition_line_rate.setter
+            def acquisition_line_rate(self, value):
+                self.calls.append(("acquisition_line_rate", value))
+
+            @property
+            def height(self):
+                return 0
+
+            @height.setter
+            def height(self, value):
+                self.calls.append(("height", value))
+
+            @property
+            def trigger_mode(self):
+                return False
+
+            @trigger_mode.setter
+            def trigger_mode(self, value):
+                self.calls.append(("trigger_mode", value))
+
+            @property
+            def trigger_selector(self):
+                return "LineStart"
+
+            @trigger_selector.setter
+            def trigger_selector(self, value):
+                self.calls.append(("trigger_selector", value))
+
+            @property
+            def trigger_source(self):
+                return "Line4"
+
+            @trigger_source.setter
+            def trigger_source(self, value):
+                self.calls.append(("trigger_source", value))
+
+            def capture(self, **kwargs):
+                self.calls.append(("capture", kwargs["duration_s"]))
+                if kwargs.get("on_frame"):
+                    kwargs["on_frame"](LineScanFrame(bytes([1, 2, 3, 4]), 1, 2, 2, 4, 0, True))
+                return CaptureResult(frames=[], stats=LineScanStats(frames=1, bytes_acquired=4))
+
+        cameras = []
+
+        def factory():
+            camera = FakeServiceCamera()
+            cameras.append(camera)
+            return camera
+
+        settings = CaptureSettings(5.0, 66.0, "On", "Line4", 2, 0.01)
+        service = CameraServiceCore(camera_factory=factory)
+
+        open_events = service.handle(CameraCommand("open", settings=settings))
+        config_events = service.handle(CameraCommand("config", settings=settings))
+        capture_events = service.handle(CameraCommand("capture", settings=settings))
+        close_events = service.handle(CameraCommand("close"))
+
+        self.assertEqual(len(cameras), 1)
+        self.assertEqual([event.kind for event in open_events], ["opened"])
+        self.assertEqual([event.kind for event in config_events], ["config_applied"])
+        self.assertEqual([event.kind for event in capture_events], ["capture_started", "capture_finished"])
+        self.assertEqual([event.kind for event in close_events], ["closed"])
+        self.assertFalse(cameras[0].is_open)
+        self.assertEqual(cameras[0].calls[0], "open")
+        self.assertEqual(cameras[0].calls[-1], "close")
+        self.assertEqual(sum(1 for call in cameras[0].calls if call == "open"), 1)
+        self.assertIn(("capture", 0.01), cameras[0].calls)
+        payload = capture_events[-1].payload
+        np.testing.assert_array_equal(payload.image_array, np.array([[1, 2], [3, 4]], dtype=np.uint8))
 
 
 if __name__ == "__main__":
