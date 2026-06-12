@@ -32,14 +32,8 @@ BASE_EXPOSURE_US_MAX = 100
 BASE_LINE_RATE_HZ_MIN = 66
 BASE_LINE_RATE_HZ_MAX = 10_000
 SETTINGS_APPLY_DEBOUNCE_MS = 250
-MAX_DISPLAY_IMAGE_BYTES = 256 * 1024 * 1024
-"""Maximum bytes retained for GUI display from one capture.
-
-The camera can produce hundreds of MB/s. Keeping every frame in Python objects
-and then duplicating it into NumPy/QImage/QPixmap can exhaust native memory and
-crash the process. The capture statistics still cover the full acquisition;
-only the preview image is capped.
-"""
+SETTINGS_SETTLE_MS = 1000
+"""Time to wait after applying camera settings before enabling capture."""
 
 
 def controls_enabled_after_open(camera_open: bool) -> bool:
@@ -121,35 +115,28 @@ class CaptureSettings:
 class GuiCapturePayload:
     result: CaptureResult
     image_array: np.ndarray
-    preview_truncated: bool
     preview_bytes: int
 
 
 class DisplayImageAccumulator:
-    """Accumulate a bounded preview array while capture buffers are still valid."""
+    """Accumulate a GUI preview array while capture buffers are still valid."""
 
-    def __init__(self, max_bytes: int = MAX_DISPLAY_IMAGE_BYTES):
-        self.max_bytes = int(max_bytes)
+    def __init__(self):
         self.width: int | None = None
         self.rows = 0
         self._data = bytearray()
-        self.truncated = False
 
     @property
     def bytes_used(self) -> int:
         return len(self._data)
 
     def add_frame(self, frame: LineScanFrame) -> None:
-        if self.truncated or self.max_bytes <= 0:
-            self.truncated = True
-            return
-
         array = frame_to_array(frame)
         if array.size == 0 or array.ndim != 2 or array.shape[1] <= 0:
             return
 
         array = np.ascontiguousarray(array, dtype=np.uint8)
-        height, frame_width = array.shape
+        _height, frame_width = array.shape
         if self.width is None:
             self.width = int(frame_width)
         elif frame_width != self.width:
@@ -162,20 +149,8 @@ class DisplayImageAccumulator:
                 self.width = new_width
             array = array[:, : self.width]
 
-        remaining = self.max_bytes - len(self._data)
-        if remaining <= 0:
-            self.truncated = True
-            return
-
-        rows_fit = min(height, remaining // self.width)
-        if rows_fit <= 0:
-            self.truncated = True
-            return
-
-        self._data.extend(array[:rows_fit, : self.width].tobytes())
-        self.rows += rows_fit
-        if rows_fit < height:
-            self.truncated = True
+        self._data.extend(array[:, : self.width].tobytes())
+        self.rows += int(array.shape[0])
 
     def to_array(self) -> np.ndarray:
         if self.width is None or self.rows <= 0:
@@ -314,15 +289,6 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
         @QtCore.Slot()
         def run(self) -> None:
             try:
-                self.progress.emit("카메라 설정 적용 중...")
-                self.camera.exposure_time = self.settings.exposure_us
-                self.camera.acquisition_line_rate = self.settings.line_rate_hz
-                self.camera.height = self.settings.frame_height
-                self.camera.trigger_mode = self.settings.trigger_mode == "On"
-                if self.settings.trigger_mode == "On":
-                    self.camera.trigger_selector = "LineStart"
-                    self.camera.trigger_source = self.settings.trigger_source
-
                 accumulator = DisplayImageAccumulator()
 
                 def on_frame(frame: LineScanFrame) -> None:
@@ -333,7 +299,6 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self.progress.emit(f"{self.settings.duration_s:.3f}초 capture 중...")
                 result = self.camera.capture(
                     duration_s=self.settings.duration_s,
-                    trigger_mode=self.settings.trigger_mode == "On",
                     store_frames=False,
                     copy_frames=True,
                     on_frame=on_frame,
@@ -342,7 +307,6 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 payload = GuiCapturePayload(
                     result=result,
                     image_array=accumulator.to_array(),
-                    preview_truncated=accumulator.truncated,
                     preview_bytes=accumulator.bytes_used,
                 )
                 self.finished.emit(payload, None)
@@ -360,6 +324,9 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self._settings_apply_timer = QtCore.QTimer(self)
             self._settings_apply_timer.setSingleShot(True)
             self._settings_apply_timer.timeout.connect(self._apply_pending_settings)
+            self._settings_settle_timer = QtCore.QTimer(self)
+            self._settings_settle_timer.setSingleShot(True)
+            self._settings_settle_timer.timeout.connect(self._settings_settled)
 
             central = QtWidgets.QWidget()
             self.setCentralWidget(central)
@@ -454,6 +421,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
 
         def closeEvent(self, event):  # noqa: N802 - Qt override
             self._settings_apply_timer.stop()
+            self._settings_settle_timer.stop()
             self._close_camera()
             super().closeEvent(event)
 
@@ -485,7 +453,17 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
         def _schedule_settings_apply(self, *_args) -> None:
             if self.camera is None or not self.camera.is_open or self._capture_running():
                 return
+            self._settings_settle_timer.stop()
+            self.capture_button.setEnabled(False)
             self._settings_apply_timer.start(SETTINGS_APPLY_DEBOUNCE_MS)
+
+        def _settings_settled(self) -> None:
+            self._update_control_enabled_state()
+            if self.camera is not None and self.camera.is_open and not self._capture_running():
+                self.status_label.setText("설정 안정화 완료. Capture 가능.")
+
+        def _settings_ready_for_capture(self) -> bool:
+            return not self._settings_apply_timer.isActive() and not self._settings_settle_timer.isActive()
 
         def _apply_pending_settings(self) -> None:
             if self.camera is None or not self.camera.is_open or self._capture_running():
@@ -494,12 +472,13 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self._apply_current_settings()
                 settings = self._settings()
                 self.status_label.setText(
-                    "설정 적용됨: "
+                    "설정 적용됨. 1초 안정화 대기 중: "
                     f"exposure={settings.exposure_us:g} µs, "
                     f"line_rate={settings.line_rate_hz:g} Hz, "
                     f"height={settings.frame_height}, "
                     f"trigger={settings.trigger_mode}"
                 )
+                self._settings_settle_timer.start(SETTINGS_SETTLE_MS)
             except Exception:
                 self.status_label.setText("설정 적용 실패")
                 self.summary_text.setPlainText(traceback.format_exc())
@@ -526,7 +505,6 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self.trigger_mode_combo,
                 self.frame_height_combo,
                 self.duration_spin,
-                self.capture_button,
             )
 
         def _update_control_enabled_state(self) -> None:
@@ -535,6 +513,9 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             capture_running = self._capture_running()
             for widget in self._control_widgets():
                 widget.setEnabled(controls_enabled and not capture_running)
+            self.capture_button.setEnabled(
+                controls_enabled and not capture_running and self._settings_ready_for_capture()
+            )
             self.trigger_source_combo.setEnabled(
                 trigger_source_enabled(
                     camera_open=camera_open and not capture_running,
@@ -557,8 +538,10 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self.camera.open()
                 self.open_close_button.setText("Close Camera")
                 self._update_control_enabled_state()
-                self.status_label.setText(f"연결됨: {DEVICE_IP_ADDR}")
+                self.status_label.setText(f"연결됨: {DEVICE_IP_ADDR}. 설정 안정화 대기 중...")
                 self._apply_current_settings()
+                self.capture_button.setEnabled(False)
+                self._settings_settle_timer.start(SETTINGS_SETTLE_MS)
             except Exception as exc:
                 self._close_camera()
                 self.status_label.setText(f"연결 실패: {exc}")
@@ -566,6 +549,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
 
         def _close_camera(self) -> None:
             self._settings_apply_timer.stop()
+            self._settings_settle_timer.stop()
             if self.capture_thread is not None and self.capture_thread.isRunning():
                 self.status_label.setText("Capture 중에는 close할 수 없습니다.")
                 return
@@ -609,6 +593,9 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             if self.capture_thread is not None and self.capture_thread.isRunning():
                 self.status_label.setText("이미 capture 중입니다.")
                 return
+            if not self._settings_ready_for_capture():
+                self.status_label.setText("설정 적용/안정화 중입니다. 잠시 후 capture 해주세요.")
+                return
 
             self._settings_apply_timer.stop()
             self.capture_button.setEnabled(False)
@@ -646,21 +633,16 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             result = payload.result
             image_array = payload.image_array
             self.image_view.set_array(image_array, capture_settings)
-            preview_note = ""
-            if payload.preview_truncated:
-                preview_note = f", preview={payload.preview_bytes / 1024 / 1024:.1f} MiB로 제한됨"
             self.status_label.setText(
                 f"Capture 완료: array shape={tuple(image_array.shape)}, "
-                f"frames={result.stats.frames}{preview_note}"
+                f"frames={result.stats.frames}, preview={payload.preview_bytes / 1024 / 1024:.1f} MiB"
             )
-            truncation_text = "yes" if payload.preview_truncated else "no"
             self.summary_text.setPlainText(
                 result.debug_summary()
                 + "\n"
                 + f"numpy_array_shape: {tuple(image_array.shape)}\n"
                 + f"numpy_array_dtype: {image_array.dtype}\n"
-                + f"preview_bytes: {payload.preview_bytes}\n"
-                + f"preview_truncated: {truncation_text}"
+                + f"preview_bytes: {payload.preview_bytes}"
             )
 
     return MainWindow

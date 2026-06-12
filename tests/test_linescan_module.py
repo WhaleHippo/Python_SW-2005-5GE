@@ -372,13 +372,12 @@ class LineScanModuleTests(unittest.TestCase):
         )
         self.assertEqual(frame_to_array(frame).shape, (0, 0))
 
-    def test_display_accumulator_caps_preview_bytes(self):
-        accumulator = DisplayImageAccumulator(max_bytes=6)
+    def test_display_accumulator_keeps_full_preview(self):
+        accumulator = DisplayImageAccumulator()
         accumulator.add_frame(LineScanFrame(bytes(range(8)), 1, 4, 2, 8, 0, True))
         array = accumulator.to_array()
-        np.testing.assert_array_equal(array, np.array([[0, 1, 2, 3]], dtype=np.uint8))
-        self.assertTrue(accumulator.truncated)
-        self.assertEqual(accumulator.bytes_used, 4)
+        np.testing.assert_array_equal(array, np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.uint8))
+        self.assertEqual(accumulator.bytes_used, 8)
 
     def test_gui_capture_result_to_array_stacks_frames_vertically(self):
         frames = [
