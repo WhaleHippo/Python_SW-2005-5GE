@@ -32,6 +32,7 @@ import linescan_module as lm
 from linescan_module import CaptureResult, LineScanCamera, LineScanFrame, LineScanStats
 from linescan_gui import (
     CaptureSettings,
+    DisplayImageAccumulator,
     capture_result_to_array,
     controls_enabled_after_open,
     frame_to_array,
@@ -355,6 +356,29 @@ class LineScanModuleTests(unittest.TestCase):
         )
         array = frame_to_array(frame)
         np.testing.assert_array_equal(array, np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.uint8))
+
+    def test_gui_frame_to_array_ignores_unsafe_pointer_like_payloads(self):
+        class PointerLikePayload:
+            pass
+
+        frame = LineScanFrame(
+            image=PointerLikePayload(),
+            block_id=1,
+            width=4,
+            height=1,
+            acquired_size=4,
+            timestamp_ns=0,
+            ok=True,
+        )
+        self.assertEqual(frame_to_array(frame).shape, (0, 0))
+
+    def test_display_accumulator_caps_preview_bytes(self):
+        accumulator = DisplayImageAccumulator(max_bytes=6)
+        accumulator.add_frame(LineScanFrame(bytes(range(8)), 1, 4, 2, 8, 0, True))
+        array = accumulator.to_array()
+        np.testing.assert_array_equal(array, np.array([[0, 1, 2, 3]], dtype=np.uint8))
+        self.assertTrue(accumulator.truncated)
+        self.assertEqual(accumulator.bytes_used, 4)
 
     def test_gui_capture_result_to_array_stacks_frames_vertically(self):
         frames = [

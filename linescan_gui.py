@@ -32,6 +32,14 @@ BASE_EXPOSURE_US_MAX = 100
 BASE_LINE_RATE_HZ_MIN = 66
 BASE_LINE_RATE_HZ_MAX = 10_000
 SETTINGS_APPLY_DEBOUNCE_MS = 250
+MAX_DISPLAY_IMAGE_BYTES = 256 * 1024 * 1024
+"""Maximum bytes retained for GUI display from one capture.
+
+The camera can produce hundreds of MB/s. Keeping every frame in Python objects
+and then duplicating it into NumPy/QImage/QPixmap can exhaust native memory and
+crash the process. The capture statistics still cover the full acquisition;
+only the preview image is capped.
+"""
 
 
 def controls_enabled_after_open(camera_open: bool) -> bool:
@@ -43,20 +51,25 @@ def trigger_source_enabled(*, camera_open: bool, trigger_mode: str) -> bool:
 
 
 def _coerce_payload_to_uint8(payload: object) -> np.ndarray:
-    """Return a 1D uint8 array from bytes-like or sequence payloads."""
+    """Return a 1D uint8 array from safe bytes-like or sequence payloads.
+
+    Avoid arbitrary ``bytes(payload)`` fallback: eBUS/SWIG may expose raw native
+    pointers whose memory becomes invalid as soon as the pipeline buffer is
+    released. Calling Python's conversion protocol on such objects after release
+    can segfault instead of raising a Python exception.
+    """
     if payload is None:
         return np.empty((0,), dtype=np.uint8)
     if isinstance(payload, np.ndarray):
         return np.asarray(payload, dtype=np.uint8).reshape(-1)
     if isinstance(payload, (bytes, bytearray, memoryview)):
         return np.frombuffer(payload, dtype=np.uint8)
-    try:
-        return np.frombuffer(bytes(payload), dtype=np.uint8)
-    except Exception:
+    if isinstance(payload, (list, tuple)):
         try:
-            return np.asarray(list(payload), dtype=np.uint8).reshape(-1)  # type: ignore[arg-type]
+            return np.asarray(payload, dtype=np.uint8).reshape(-1)
         except Exception:
             return np.empty((0,), dtype=np.uint8)
+    return np.empty((0,), dtype=np.uint8)
 
 
 def frame_to_array(frame: LineScanFrame) -> np.ndarray:
@@ -102,6 +115,72 @@ class CaptureSettings:
     trigger_source: str
     frame_height: int
     duration_s: float
+
+
+@dataclass(frozen=True)
+class GuiCapturePayload:
+    result: CaptureResult
+    image_array: np.ndarray
+    preview_truncated: bool
+    preview_bytes: int
+
+
+class DisplayImageAccumulator:
+    """Accumulate a bounded preview array while capture buffers are still valid."""
+
+    def __init__(self, max_bytes: int = MAX_DISPLAY_IMAGE_BYTES):
+        self.max_bytes = int(max_bytes)
+        self.width: int | None = None
+        self.rows = 0
+        self._data = bytearray()
+        self.truncated = False
+
+    @property
+    def bytes_used(self) -> int:
+        return len(self._data)
+
+    def add_frame(self, frame: LineScanFrame) -> None:
+        if self.truncated or self.max_bytes <= 0:
+            self.truncated = True
+            return
+
+        array = frame_to_array(frame)
+        if array.size == 0 or array.ndim != 2 or array.shape[1] <= 0:
+            return
+
+        array = np.ascontiguousarray(array, dtype=np.uint8)
+        height, frame_width = array.shape
+        if self.width is None:
+            self.width = int(frame_width)
+        elif frame_width != self.width:
+            new_width = min(self.width, int(frame_width))
+            if new_width <= 0:
+                return
+            if new_width < self.width and self.rows > 0:
+                existing = np.frombuffer(self._data, dtype=np.uint8).reshape(self.rows, self.width)
+                self._data = bytearray(np.ascontiguousarray(existing[:, :new_width]).tobytes())
+                self.width = new_width
+            array = array[:, : self.width]
+
+        remaining = self.max_bytes - len(self._data)
+        if remaining <= 0:
+            self.truncated = True
+            return
+
+        rows_fit = min(height, remaining // self.width)
+        if rows_fit <= 0:
+            self.truncated = True
+            return
+
+        self._data.extend(array[:rows_fit, : self.width].tobytes())
+        self.rows += rows_fit
+        if rows_fit < height:
+            self.truncated = True
+
+    def to_array(self) -> np.ndarray:
+        if self.width is None or self.rows <= 0:
+            return np.empty((0, 0), dtype=np.uint8)
+        return np.frombuffer(self._data, dtype=np.uint8).reshape(self.rows, self.width).copy()
 
 
 def _format_filename_number(value: float, unit: str) -> str:
@@ -244,15 +323,29 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                     self.camera.trigger_selector = "LineStart"
                     self.camera.trigger_source = self.settings.trigger_source
 
+                accumulator = DisplayImageAccumulator()
+
+                def on_frame(frame: LineScanFrame) -> None:
+                    # Convert while the eBUS pipeline buffer is still checked out.
+                    # This avoids later GUI access to a released native pointer.
+                    accumulator.add_frame(frame)
+
                 self.progress.emit(f"{self.settings.duration_s:.3f}초 capture 중...")
                 result = self.camera.capture(
                     duration_s=self.settings.duration_s,
                     trigger_mode=self.settings.trigger_mode == "On",
-                    store_frames=True,
+                    store_frames=False,
                     copy_frames=True,
+                    on_frame=on_frame,
                     debug=False,
                 )
-                self.finished.emit(result, None)
+                payload = GuiCapturePayload(
+                    result=result,
+                    image_array=accumulator.to_array(),
+                    preview_truncated=accumulator.truncated,
+                    preview_bytes=accumulator.bytes_used,
+                )
+                self.finished.emit(payload, None)
             except Exception:
                 self.finished.emit(None, traceback.format_exc())
 
@@ -535,7 +628,7 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
             self.capture_thread.start()
 
         @QtCore.Slot(object, object)
-        def _capture_finished(self, result: CaptureResult | None, error_text: str | None) -> None:
+        def _capture_finished(self, payload: GuiCapturePayload | None, error_text: str | None) -> None:
             self.open_close_button.setEnabled(True)
             capture_settings = self.capture_worker.settings if self.capture_worker is not None else None
             self.capture_thread = None
@@ -546,20 +639,28 @@ def make_application_classes(QtCore, QtGui, QtWidgets):
                 self.status_label.setText("Capture 실패")
                 self.summary_text.setPlainText(str(error_text))
                 return
-            if result is None:
+            if payload is None:
                 self.status_label.setText("Capture 결과가 없습니다.")
                 return
 
-            image_array = capture_result_to_array(result)
+            result = payload.result
+            image_array = payload.image_array
             self.image_view.set_array(image_array, capture_settings)
+            preview_note = ""
+            if payload.preview_truncated:
+                preview_note = f", preview={payload.preview_bytes / 1024 / 1024:.1f} MiB로 제한됨"
             self.status_label.setText(
-                f"Capture 완료: array shape={tuple(image_array.shape)}, frames={result.stats.frames}"
+                f"Capture 완료: array shape={tuple(image_array.shape)}, "
+                f"frames={result.stats.frames}{preview_note}"
             )
+            truncation_text = "yes" if payload.preview_truncated else "no"
             self.summary_text.setPlainText(
                 result.debug_summary()
                 + "\n"
                 + f"numpy_array_shape: {tuple(image_array.shape)}\n"
-                + f"numpy_array_dtype: {image_array.dtype}"
+                + f"numpy_array_dtype: {image_array.dtype}\n"
+                + f"preview_bytes: {payload.preview_bytes}\n"
+                + f"preview_truncated: {truncation_text}"
             )
 
     return MainWindow
