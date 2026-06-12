@@ -35,7 +35,6 @@ from linescan_gui import (
     CameraServiceCore,
     CaptureSettings,
     DisplayImageAccumulator,
-    capture_result_to_array,
     controls_enabled_after_open,
     frame_to_array,
     next_capture_image_path,
@@ -380,18 +379,6 @@ class LineScanModuleTests(unittest.TestCase):
         array = accumulator.to_array()
         np.testing.assert_array_equal(array, np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.uint8))
         self.assertEqual(accumulator.bytes_used, 8)
-
-    def test_gui_capture_result_to_array_stacks_frames_vertically(self):
-        frames = [
-            LineScanFrame(bytes([1, 2, 3, 4]), 1, 2, 2, 4, 0, True),
-            LineScanFrame(bytes([5, 6, 7, 8]), 2, 2, 2, 4, 0, True),
-        ]
-        result = CaptureResult(frames=frames, stats=LineScanStats())
-        array = capture_result_to_array(result)
-        np.testing.assert_array_equal(
-            array,
-            np.array([[1, 2], [3, 4], [5, 6], [7, 8]], dtype=np.uint8),
-        )
 
     def test_gui_controls_are_enabled_only_after_open_and_trigger_source_needs_trigger_on(self):
         self.assertFalse(controls_enabled_after_open(False))

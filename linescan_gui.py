@@ -90,19 +90,6 @@ def frame_to_array(frame: Any) -> np.ndarray:
     return payload.reshape(1, -1).copy()
 
 
-def capture_result_to_array(result: Any) -> np.ndarray:
-    """Stack captured grayscale frames vertically into one 2D image array."""
-    arrays = [arr for arr in (frame_to_array(frame) for frame in result.frames) if arr.size]
-    if not arrays:
-        return np.empty((0, 0), dtype=np.uint8)
-
-    min_width = min(arr.shape[1] for arr in arrays)
-    if min_width <= 0:
-        return np.empty((0, 0), dtype=np.uint8)
-    arrays = [arr[:, :min_width] for arr in arrays]
-    return np.vstack(arrays).astype(np.uint8, copy=False)
-
-
 @dataclass(frozen=True)
 class CaptureSettings:
     exposure_us: float
